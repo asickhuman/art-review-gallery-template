@@ -17,7 +17,9 @@
     "label": "Sample hero \u2014 RED (placeholder)",
     "note": "",
     "added_at": "2026-10-31T12:45:33-04:00",
-    "reviewed_at": null
+    "reviewed_at": null,
+    "asset_class": "character",
+    "act": null
   },
   {
     "id": "sample-hero-round-1-A2",
@@ -37,7 +39,9 @@
     "label": "Sample hero \u2014 BLUE (placeholder)",
     "note": "",
     "added_at": "2026-10-31T12:45:33-04:00",
-    "reviewed_at": null
+    "reviewed_at": null,
+    "asset_class": "character",
+    "act": null
   },
   {
     "id": "sample-hero-round-1-A3",
@@ -57,7 +61,9 @@
     "label": "Sample hero \u2014 GREEN (placeholder)",
     "note": "",
     "added_at": "2026-10-31T12:45:33-04:00",
-    "reviewed_at": null
+    "reviewed_at": null,
+    "asset_class": "character",
+    "act": null
   },
   {
     "id": "sample-hero-round-1-B1",
@@ -77,6 +83,8 @@
     "label": "Sample hero \u2014 AMBER (placeholder)",
     "note": "",
     "added_at": "2026-10-31T12:45:33-04:00",
-    "reviewed_at": null
+    "reviewed_at": null,
+    "asset_class": "character",
+    "act": null
   }
 ]

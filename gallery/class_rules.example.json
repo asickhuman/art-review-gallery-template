@@ -1,0 +1,79 @@
+{
+  "classes": [
+    "floor",
+    "wall",
+    "door",
+    "prop",
+    "decal",
+    "rubble",
+    "backdrop",
+    "character",
+    "portrait",
+    "ui",
+    "relic",
+    "fx",
+    "other"
+  ],
+  "labels": {
+    "character": "character/enemy",
+    "ui": "UI",
+    "fx": "FX"
+  },
+  "prefix_rules": [
+    {
+      "prefix": "backdrop",
+      "class": "backdrop"
+    },
+    {
+      "prefix": "relic",
+      "class": "relic"
+    },
+    {
+      "prefix": "portrait",
+      "class": "portrait"
+    },
+    {
+      "prefix": "fx-",
+      "class": "fx"
+    },
+    {
+      "prefix": "vfx-",
+      "class": "fx"
+    },
+    {
+      "prefix": "ui-",
+      "class": "ui"
+    },
+    {
+      "prefix": "icon-",
+      "class": "ui"
+    },
+    {
+      "prefix": "char-",
+      "class": "character"
+    },
+    {
+      "prefix": "enemy-",
+      "class": "character"
+    },
+    {
+      "prefix": "npc-",
+      "class": "character"
+    },
+    {
+      "prefix": "sample-",
+      "class": "character"
+    }
+  ],
+  "map_kinds": [
+    "floor",
+    "wall",
+    "door",
+    "prop",
+    "decal",
+    "rubble"
+  ],
+  "icon_suffix_class": "ui",
+  "fallback": "other",
+  "derive_class_from_asset_token": true
+}

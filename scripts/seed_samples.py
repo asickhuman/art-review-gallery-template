@@ -115,6 +115,8 @@ def main() -> None:
                 "note": "",
                 "added_at": now,
                 "reviewed_at": None,
+                "asset_class": "character",
+                "act": None,
             }
         )
     (ROOT / "manifest.json").write_text(json.dumps(entries, indent=2) + "\n")

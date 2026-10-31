@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import re
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import urllib.request
 
@@ -33,6 +34,142 @@ BATCH_POLL_SEC = float(os.environ.get("GALLERY_WEBHOOK_POLL_SEC", "5"))
 
 STATUSES = ("needs-review", "finalist", "approved", "rejected", "training", "in-game")
 RECENT_REJECT_HOURS = 48
+
+# --- Asset class / act filters (configurable, no project-specific names) ---
+# Override with gallery/class_rules.json (see class_rules.example.json).
+CLASS_RULES_PATH = GALLERY_DIR / "class_rules.json"
+_DEFAULT_CLASS_RULES = {
+    "classes": [
+        "floor", "wall", "door", "prop", "decal", "rubble",
+        "backdrop", "character", "portrait", "ui", "relic", "fx", "other",
+    ],
+    "labels": {
+        "character": "character/enemy",
+        "ui": "UI",
+        "fx": "FX",
+    },
+    "prefix_rules": [
+        {"prefix": "backdrop", "class": "backdrop"},
+        {"prefix": "relic", "class": "relic"},
+        {"prefix": "portrait", "class": "portrait"},
+        {"prefix": "fx-", "class": "fx"},
+        {"prefix": "vfx-", "class": "fx"},
+        {"prefix": "ui-", "class": "ui"},
+        {"prefix": "icon-", "class": "ui"},
+        {"prefix": "char-", "class": "character"},
+        {"prefix": "enemy-", "class": "character"},
+        {"prefix": "npc-", "class": "character"},
+    ],
+    "map_kinds": ["floor", "wall", "door", "prop", "decal", "rubble"],
+    "icon_suffix_class": "ui",
+    "fallback": "other",
+    "derive_class_from_asset_token": True,
+}
+_ACT_RE = re.compile(r"(?:^|[-\s_/])act[_-]?(\d+)\b", re.I)
+_MAP_KIND_RE = re.compile(r"^map-act(\d+)-([a-z0-9]+)", re.I)
+_class_rules_cache: dict | None = None
+
+
+def load_class_rules() -> dict:
+    global _class_rules_cache
+    if _class_rules_cache is not None:
+        return _class_rules_cache
+    rules = dict(_DEFAULT_CLASS_RULES)
+    rules["prefix_rules"] = list(_DEFAULT_CLASS_RULES["prefix_rules"])
+    rules["labels"] = dict(_DEFAULT_CLASS_RULES["labels"])
+    rules["classes"] = list(_DEFAULT_CLASS_RULES["classes"])
+    rules["map_kinds"] = list(_DEFAULT_CLASS_RULES["map_kinds"])
+    if CLASS_RULES_PATH.exists():
+        try:
+            data = json.loads(CLASS_RULES_PATH.read_text() or "{}")
+            if isinstance(data, dict):
+                if isinstance(data.get("classes"), list) and data["classes"]:
+                    rules["classes"] = [str(c) for c in data["classes"]]
+                if isinstance(data.get("labels"), dict):
+                    rules["labels"].update({str(k): str(v) for k, v in data["labels"].items()})
+                if isinstance(data.get("prefix_rules"), list):
+                    rules["prefix_rules"] = [
+                        {"prefix": str(r.get("prefix", "")).lower(), "class": str(r.get("class", "other"))}
+                        for r in data["prefix_rules"] if isinstance(r, dict) and r.get("prefix")
+                    ]
+                if isinstance(data.get("map_kinds"), list) and data["map_kinds"]:
+                    rules["map_kinds"] = [str(k).lower() for k in data["map_kinds"]]
+                if "icon_suffix_class" in data:
+                    rules["icon_suffix_class"] = data.get("icon_suffix_class")
+                if "fallback" in data:
+                    rules["fallback"] = str(data.get("fallback") or "other")
+                if "derive_class_from_asset_token" in data:
+                    rules["derive_class_from_asset_token"] = bool(data.get("derive_class_from_asset_token"))
+        except Exception:
+            pass
+    _class_rules_cache = rules
+    return rules
+
+
+def asset_class_labels() -> dict:
+    rules = load_class_rules()
+    labels = {c: c for c in rules["classes"]}
+    labels.update(rules.get("labels") or {})
+    return labels
+
+
+def classify_asset(asset: str = "", source_job: str = "", round_name: str = "") -> tuple[str, int | None]:
+    """Derive (asset_class, act) from names using configurable rules."""
+    rules = load_class_rules()
+    name = (asset or "").strip().lower()
+    blob = " ".join([name, (source_job or "").lower(), (round_name or "").lower()])
+    act = None
+    m = _ACT_RE.search(blob)
+    if m:
+        act = int(m.group(1))
+    mm = _MAP_KIND_RE.match(name)
+    if mm:
+        act = int(mm.group(1))
+        kind = mm.group(2).lower()
+        if kind in set(rules.get("map_kinds") or []):
+            return kind, act
+        return str(rules.get("fallback") or "other"), act
+    for rule in rules.get("prefix_rules") or []:
+        prefix = (rule.get("prefix") or "").lower()
+        if prefix and name.startswith(prefix):
+            return str(rule.get("class") or rules.get("fallback") or "other"), act
+    icon_class = rules.get("icon_suffix_class")
+    if icon_class and ("-icon" in name or name.endswith("icon")):
+        return str(icon_class), act
+    known = set(rules.get("classes") or [])
+    if rules.get("derive_class_from_asset_token") and name:
+        token = name.split("-")[0]
+        if token in known:
+            return token, act
+        # If asset is like "hero-warrior", keep first token as a dynamic class only when
+        # it already appears in configured classes; otherwise fallback.
+    return str(rules.get("fallback") or "other"), act
+
+
+def ensure_class_fields(entry: dict) -> dict:
+    if not isinstance(entry, dict):
+        return entry
+    rules = load_class_rules()
+    known = set(rules.get("classes") or [])
+    cls = entry.get("asset_class")
+    if cls not in known:
+        derived_cls, derived_act = classify_asset(
+            entry.get("asset") or "",
+            entry.get("source_job") or "",
+            entry.get("round") or "",
+        )
+        entry["asset_class"] = derived_cls
+        if "act" not in entry:
+            entry["act"] = derived_act
+    elif "act" not in entry:
+        _, derived_act = classify_asset(
+            entry.get("asset") or "",
+            entry.get("source_job") or "",
+            entry.get("round") or "",
+        )
+        entry["act"] = derived_act
+    return entry
+
 
 # Prefer gallery venv segno
 _VENV_SITE = GALLERY_DIR / ".venv" / "lib"
@@ -621,6 +758,16 @@ textarea{min-height:56px;resize:vertical;}
 .bulk-actions button:disabled{opacity:.35;cursor:not-allowed;}
 .clear-sel{background:#12301a;color:var(--muted);border:1px solid var(--line);}
 .foot{text-align:center;color:var(--muted);font-size:11px;}
+
+.filter-row{display:flex;flex-direction:column;gap:6px;margin-top:4px;}
+.filter-label{font-size:11px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase;}
+.filter-chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+.fchip{appearance:none;cursor:pointer;border:1px solid #1a2e1a;background:#0a120c;color:#5a7a5a;
+  font:700 11px/1 var(--mono);letter-spacing:.03em;text-transform:uppercase;padding:10px 12px;border-radius:4px;
+  text-align:center;white-space:nowrap;min-height:44px;min-width:44px;
+  display:inline-flex;align-items:center;justify-content:center;}
+.fchip.on{color:#041204;background:var(--cyan);border-color:var(--cyan);}
+.fchip.dim{opacity:.55;}
 """
 
 DESKTOP_EXTRA = r"""
@@ -660,6 +807,8 @@ body{padding-left:max(1vw, var(--safe-l)); padding-right:max(1vw, var(--safe-r))
 .view-controls input{width:20px; height:20px;}
 .legend{font-size:13px; margin-top:6px;}
 .meta{font-size:13px;}
+.filter-label{font-size:13px;}
+.fchip{font-size:16px; line-height:1.15; font-weight:800; min-height:48px; padding:12px 16px; border-radius:6px;}
 """
 
 MOBILE_EXTRA = r"""
@@ -689,13 +838,36 @@ MOBILE_EXTRA = r"""
 
 SHARED_JS = r"""
 const STATUS_TABS = ['needs-review','finalists','recently-rejected','approved','rejected','training','in-game','all'];
+let CLASS_ORDER = ['floor','wall','door','prop','decal','rubble','backdrop','character','portrait','ui','relic','fx','other'];
+let CLASS_LABELS = {floor:'floor',wall:'wall',door:'door',prop:'prop',decal:'decal',rubble:'rubble',backdrop:'backdrop',character:'character/enemy',portrait:'portrait',ui:'UI',relic:'relic',fx:'FX',other:'other'};
 const RECENT_MS = 48*60*60*1000;
 let current = 'needs-review';
+let classFilter = 'all';
+let actFilter = 'all';
 let items = [];
 let configured = false;
+let classCounts = {};
+let actCounts = {};
 const selected = new Set();
 let undoState = null;
 const IS_MOBILE = !!window.__MOBILE__;
+
+function readQuery(){
+  const q=new URLSearchParams(location.search);
+  const st=q.get('status'); if(st && STATUS_TABS.includes(st)) current=st;
+  const cl=q.get('class'); if(cl) classFilter=cl;
+  const ac=q.get('act'); if(ac) actFilter=ac;
+}
+function writeQuery(){
+  const q=new URLSearchParams();
+  if(current && current!=='needs-review') q.set('status', current);
+  if(classFilter && classFilter!=='all') q.set('class', classFilter);
+  if(actFilter && actFilter!=='all') q.set('act', actFilter);
+  const qs=q.toString();
+  const next=location.pathname+(qs?('?'+qs):'');
+  if(next!==location.pathname+location.search) history.replaceState(null,'',next);
+}
+readQuery();
 
 function parseTs(s){ if(!s) return null; const d=new Date(s); return isNaN(d)?null:d; }
 function isRecentlyRejected(it){
@@ -724,11 +896,38 @@ async function api(path, opts){
   const r=await fetch(path, opts); const j=await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(j.error||r.statusText); return j;
 }
+function statusMatch(it){
+  if(current==='all') return true;
+  if(current==='recently-rejected') return isRecentlyRejected(it);
+  if(current==='finalists') return it.status==='finalist';
+  return it.status===current;
+}
+function classMatch(it){
+  if(classFilter==='all') return true;
+  return (it.asset_class||'other')===classFilter;
+}
+function actMatch(it){
+  if(actFilter==='all') return true;
+  if(actFilter==='none') return it.act==null || it.act==='' || typeof it.act==='undefined';
+  return String(it.act)===String(actFilter);
+}
 function visibleItems(){
-  if(current==='all') return items;
-  if(current==='recently-rejected') return items.filter(isRecentlyRejected);
-  if(current==='finalists') return items.filter(i=>i.status==='finalist');
-  return items.filter(i=>i.status===current);
+  return items.filter(it=>statusMatch(it) && classMatch(it) && actMatch(it));
+}
+function recountFilters(){
+  classCounts={}; actCounts={all:0};
+  for(const it of items){
+    if(!statusMatch(it)) continue;
+    const c=it.asset_class||'other';
+    classCounts[c]=(classCounts[c]||0)+1;
+    actCounts.all+=1;
+    if(it.act==null || it.act==='' || typeof it.act==='undefined'){
+      actCounts.none=(actCounts.none||0)+1;
+    } else {
+      const k=String(it.act);
+      actCounts[k]=(actCounts[k]||0)+1;
+    }
+  }
 }
 function updateSelUI(){
   const n=selected.size;
@@ -768,10 +967,50 @@ function renderTabs(){
   for(const s of STATUS_TABS){
     const b=document.createElement('button');
     b.className='rtab'+(s===current?' on':'')+(s==='recently-rejected'?' recent':'');
-    let count = s==='all'?items.length: s==='recently-rejected'?items.filter(isRecentlyRejected).length: s==='finalists'?items.filter(i=>i.status==='finalist').length: items.filter(i=>i.status===s).length;
+    const base = s==='all'?items: s==='recently-rejected'?items.filter(isRecentlyRejected): s==='finalists'?items.filter(i=>i.status==='finalist'): items.filter(i=>i.status===s);
+    const count = base.filter(it=>classMatch(it)&&actMatch(it)).length;
     b.textContent=`${tabLabel(s)} (${count})`;
-    b.onclick=()=>{ current=s; selected.clear(); renderTabs(); renderGrid(); updateSelUI(); };
+    b.onclick=()=>{ current=s; selected.clear(); writeQuery(); recountFilters(); renderTabs(); renderClassAct(); renderGrid(); updateSelUI(); };
     tabs.appendChild(b);
+  }
+}
+function renderClassAct(){
+  recountFilters();
+  const classRow=document.getElementById('classChips');
+  const actRow=document.getElementById('actChips');
+  if(!classRow||!actRow) return;
+  classRow.innerHTML='';
+  const allClass=document.createElement('button');
+  allClass.type='button';
+  const allClassCount=Object.values(classCounts).reduce((a,b)=>a+b,0);
+  allClass.className='fchip'+(classFilter==='all'?' on':'');
+  allClass.textContent=`all (${allClassCount})`;
+  allClass.onclick=()=>{ classFilter='all'; selected.clear(); writeQuery(); renderTabs(); renderClassAct(); renderGrid(); updateSelUI(); };
+  classRow.appendChild(allClass);
+  const order = CLASS_ORDER.slice();
+  for(const c of Object.keys(classCounts)){ if(!order.includes(c)) order.push(c); }
+  for(const c of order){
+    const n=classCounts[c]||0;
+    if(n===0 && classFilter!==c) continue;
+    const b=document.createElement('button');
+    b.type='button';
+    b.className='fchip'+(classFilter===c?' on':'')+(n===0?' dim':'');
+    b.textContent=`${CLASS_LABELS[c]||c} (${n})`;
+    b.onclick=()=>{ classFilter=c; selected.clear(); writeQuery(); renderTabs(); renderClassAct(); renderGrid(); updateSelUI(); };
+    classRow.appendChild(b);
+  }
+  actRow.innerHTML='';
+  const acts=['all',...Object.keys(actCounts).filter(k=>k!=='all'&&k!=='none').sort((a,b)=>Number(a)-Number(b))];
+  if(actCounts.none) acts.push('none');
+  for(const a of acts){
+    const n = a==='all' ? (actCounts.all||0) : (actCounts[a]||0);
+    if(a!=='all' && n===0 && actFilter!==a) continue;
+    const b=document.createElement('button');
+    b.type='button';
+    b.className='fchip'+(String(actFilter)===String(a)?' on':'')+(n===0?' dim':'');
+    b.textContent = a==='all' ? `all (${n})` : (a==='none' ? `no act (${n})` : `act ${a} (${n})`);
+    b.onclick=()=>{ actFilter=a; selected.clear(); writeQuery(); renderTabs(); renderClassAct(); renderGrid(); updateSelUI(); };
+    actRow.appendChild(b);
   }
 }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -972,9 +1211,11 @@ function wire(){
 async function load(){
   const data=await api('/api/items');
   items=data.items||[]; configured=!!data.configured;
+  if(data.class_labels) CLASS_LABELS=Object.assign({}, CLASS_LABELS, data.class_labels);
+  if(Array.isArray(data.class_order) && data.class_order.length) CLASS_ORDER=data.class_order.slice();
   for(const id of [...selected]){ if(!items.some(i=>i.id===id)) selected.delete(id); }
   document.getElementById('banner').classList.toggle('show', !configured);
-  renderTabs(); renderGrid();
+  recountFilters(); renderTabs(); renderClassAct(); renderGrid();
 }
 wire(); load(); setInterval(load, 30000);
 """
@@ -1024,6 +1265,14 @@ def page(mobile: bool) -> str:
     </div>
     <div id="banner" class="banner">Webhook not configured — clicks logged locally. Copy config.example.json to gallery/config.json and set url + key if you want remote notifications.</div>
     <nav class="range-tog" id="tabs" role="tablist" aria-label="Status"></nav>
+    <div class="filter-row">
+      <div class="filter-label">Class</div>
+      <div class="filter-chips" id="classChips" role="group" aria-label="Asset class"></div>
+    </div>
+    <div class="filter-row">
+      <div class="filter-label">Act</div>
+      <div class="filter-chips" id="actChips" role="group" aria-label="Act"></div>
+    </div>
     <div class="view-controls"><label><input type="checkbox" id="selectAll"/> Select all in view</label></div>
     <div class="meta" id="meta"></div>
     <div class="legend"><b class="ship">Finalist</b> = shortlist · <b class="final">Pick as final</b> = ship · <b class="steer">Steer</b> = train this way · <b class="reject">Reject</b> = no</div>
@@ -1061,7 +1310,7 @@ def page(mobile: bool) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ArtGallery/1.3"
+    server_version = "ArtGallery/1.4-filters"
 
     def log_message(self, fmt, *args):
         print(f"[{now_iso()}] {self.address_string()} " + (fmt % args), flush=True)
@@ -1093,8 +1342,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/items":
             qs = parse_qs(parsed.query)
             status = (qs.get("status") or [None])[0]
+            class_f = (qs.get("class") or [None])[0]
+            act_f = (qs.get("act") or [None])[0]
             entries = load_manifest()
+            for e in entries:
+                ensure_class_fields(e)
             cfg = load_config()
+            rules = load_class_rules()
             items = []
             for e in entries:
                 if status and status != "all":
@@ -1106,6 +1360,20 @@ class Handler(BaseHTTPRequestHandler):
                             continue
                     elif e.get("status") != status:
                         continue
+                if class_f and class_f != "all":
+                    if (e.get("asset_class") or "other") != class_f:
+                        continue
+                if act_f and act_f != "all":
+                    if act_f == "none":
+                        if e.get("act") is not None:
+                            continue
+                    else:
+                        try:
+                            want = int(act_f)
+                        except Exception:
+                            want = act_f
+                        if e.get("act") != want and str(e.get("act")) != str(act_f):
+                            continue
                 sp = e.get("spark_path") or ""
                 tp = e.get("thumb_path") or ""
                 items.append({
@@ -1113,18 +1381,43 @@ class Handler(BaseHTTPRequestHandler):
                         "id", "round", "asset", "status", "spark_path", "source_path",
                         "source_job", "prompt", "model", "size", "added_at", "cell", "key",
                         "seed", "note", "destination", "steer", "rejected_at", "reviewed_at",
-                        "noted_at", "label",
+                        "noted_at", "label", "asset_class", "act",
                     )},
                     "recently_rejected": is_recently_rejected(e),
                     "thumb_url": f"/file?p={quote(tp)}" if tp else f"/file?p={quote(sp)}",
                     "image_url": f"/file?p={quote(sp)}",
                 })
+            class_list = list(rules.get("classes") or [])
+            class_counts = {c: 0 for c in class_list}
+            act_counts: dict = {}
+            for e in entries:
+                cls = e.get("asset_class") or "other"
+                class_counts[cls] = class_counts.get(cls, 0) + 1
+                a = e.get("act")
+                key = "none" if a is None else str(a)
+                act_counts[key] = act_counts.get(key, 0) + 1
+            nr_class = {c: 0 for c in class_list}
+            nr_act: dict = {}
+            for e in entries:
+                if e.get("status") != "needs-review":
+                    continue
+                cls = e.get("asset_class") or "other"
+                nr_class[cls] = nr_class.get(cls, 0) + 1
+                a = e.get("act")
+                key = "none" if a is None else str(a)
+                nr_act[key] = nr_act.get(key, 0) + 1
             self._json(200, {
                 "items": items,
                 "configured": config_ready(cfg),
                 "https_url": public_https_url(),
                 "counts": {s: sum(1 for e in entries if e.get("status") == s) for s in STATUSES},
                 "recently_rejected": sum(1 for e in entries if is_recently_rejected(e)),
+                "class_counts": class_counts,
+                "act_counts": act_counts,
+                "needs_review_by_class": nr_class,
+                "needs_review_by_act": nr_act,
+                "class_labels": asset_class_labels(),
+                "class_order": class_list,
             })
             return
         if path == "/file":

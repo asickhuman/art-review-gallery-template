@@ -56,6 +56,26 @@ Health check: `GET /api/health`
 | `ART_GALLERY_HTTPS_PORT` | `8443` | Port used when scheme is `https` |
 | `GALLERY_WEBHOOK_BATCH_SEC` | `300` | Max seconds between webhook batches |
 
+
+## Class and act filters
+
+The gallery can filter by **asset class** and **act** in addition to status tabs.
+
+- Class and act are stored on each manifest entry (`asset_class`, `act`).
+- If missing, the server derives them from the asset / round / job name using rules in `gallery/class_rules.json`.
+- Copy `gallery/class_rules.example.json` to `gallery/class_rules.json` and edit prefixes to match your naming.
+- Filters combine with status tabs. The selection is kept in the URL, e.g. `/?class=prop&act=3` or `/m?class=ui`.
+
+Default derivation (no custom rules file):
+
+| Name pattern | Class | Act |
+| --- | --- | --- |
+| `map-act{N}-{kind}-…` | `kind` (`floor`, `wall`, `door`, `prop`, `decal`, `rubble`) | `N` |
+| `backdrop…` / `relic…` / `portrait…` / `fx-…` | matching class | from `act{N}` if present |
+| `*-icon` / `ui-…` / `icon-…` | `ui` | from `act{N}` if present |
+| `char-…` / `enemy-…` / `npc-…` | `character` | from `act{N}` if present |
+| anything else | `other` (or a configured fallback) | from `act{N}` if present |
+
 ## Layout
 
 ```
@@ -63,6 +83,8 @@ Health check: `GET /api/health`
 ├── gallery/
 │   ├── server.py              # HTTP UI + API
 │   ├── config.json            # local only (gitignored) — copy from config.example.json
+│   ├── class_rules.example.json
+│   ├── class_rules.json       # optional; copy from example (gitignored)
 │   └── art-gallery.service.example
 ├── manifest.json              # index of every reviewable image
 ├── needs-review/<round>/      # awaiting a decision (+ optional thumbs/)
