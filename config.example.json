@@ -1,0 +1,5 @@
+{
+  "url": "https://example.com/your-webhook-endpoint",
+  "key": "YOUR_WEBHOOK_BEARER_TOKEN",
+  "public_url": "http://localhost:11490/"
+}

@@ -1,0 +1,2 @@
+# Optional: QR code on /qr.png (gallery works without it)
+segno>=1.5.0

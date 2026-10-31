@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# Local runtime / secrets (copy from config.example.json)
+gallery/config.json
+gallery/clicks.jsonl
+gallery/clicks.*.jsonl
+gallery/webhook_cursor.json
+gallery/*.bak*
+gallery/server.py.bak*
+
+# Models / LoRAs / checkpoints (never commit)
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.lora
+*.bin
+
+# User art by default (keep the labeled sample round)
+needs-review/**
+!needs-review/sample-hero-round-1/
+!needs-review/sample-hero-round-1/**
+finalists/**
+approved/**
+rejected/**
+training/**
+in-game/
+feedback/**
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
