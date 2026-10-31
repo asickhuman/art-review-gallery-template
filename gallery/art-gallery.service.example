@@ -1,0 +1,17 @@
+[Unit]
+Description=Art review gallery
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/path/to/art-review-gallery-template/gallery
+Environment=ART_GALLERY_HOST=0.0.0.0
+Environment=ART_GALLERY_PORT=11490
+# Optional public URL shown in the UI / QR (Tailscale HTTPS, reverse proxy, etc.)
+# Environment=ART_GALLERY_PUBLIC_URL=https://gallery.example.com/
+ExecStart=/usr/bin/python3 %h/path/to/art-review-gallery-template/gallery/server.py
+Restart=on-failure
+RestartSec=3
+Nice=10
+
+[Install]
+WantedBy=default.target
