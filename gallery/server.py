@@ -40,7 +40,7 @@ THUMB_MAX = int(os.environ.get("GALLERY_THUMB_MAX", "256"))
 # Asset class / act derived from asset or job names (rule-based, no model).
 ASSET_CLASSES = (
     "floor", "wall", "door", "prop", "decal", "rubble",
-    "backdrop", "character", "portrait", "ui", "relic", "fx", "other",
+    "backdrop", "character", "portrait", "ui", "weapon", "relic", "fx", "other",
 )
 ASSET_CLASS_LABELS = {
     "floor": "floor",
@@ -53,6 +53,7 @@ ASSET_CLASS_LABELS = {
     "character": "characters/enemies",
     "portrait": "portraits",
     "ui": "UI",
+    "weapon": "weapon",
     "relic": "relic",
     "fx": "effects",
     "other": "other",
@@ -93,6 +94,8 @@ def classify_asset(asset: str = "", source_job: str = "", round_name: str = "") 
         return "fx", act
     if name in _CHARACTER_EXACT or any(name.startswith(p) for p in _CHARACTER_PREFIXES):
         return "character", act
+    if name.startswith("weapon-") and "-icon" not in name:
+        return "weapon", act
     if any(name.startswith(p) for p in _UI_PREFIXES) or "-icon" in name:
         return "ui", act
     return "other", act
