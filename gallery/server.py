@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Art review gallery — desktop / and mobile /m. Steer, reject, finalist flow."""
+"""Digital Veil art review gallery — Token Annihilator theme, / and /m."""
 from __future__ import annotations
 
 import io
@@ -32,90 +32,44 @@ FINAL_QUIET_SEC = int(os.environ.get("GALLERY_WEBHOOK_FINAL_QUIET_SEC", "90"))
 FINAL_MIN_GAP_SEC = int(os.environ.get("GALLERY_WEBHOOK_FINAL_MIN_GAP_SEC", "180"))  # 3 min
 BATCH_POLL_SEC = float(os.environ.get("GALLERY_WEBHOOK_POLL_SEC", "5"))
 
-STATUSES = ("needs-review", "finalist", "approved", "rejected", "training", "in-game")
-RECENT_REJECT_HOURS = 48
+STATUSES = ("needs-review", "finalist", "approved", "rejected", "training", "in-game", "archived", "hidden-empty")
+RECENT_REJECT_HOURS = 24
+EMPTY_OPAQUE_FRAC = float(os.environ.get("GALLERY_EMPTY_OPAQUE_FRAC", "0.02"))
+THUMB_MAX = int(os.environ.get("GALLERY_THUMB_MAX", "256"))
 
-# --- Asset class / act filters (configurable, no project-specific names) ---
-# Override with gallery/class_rules.json (see class_rules.example.json).
-CLASS_RULES_PATH = GALLERY_DIR / "class_rules.json"
-_DEFAULT_CLASS_RULES = {
-    "classes": [
-        "floor", "wall", "door", "prop", "decal", "rubble",
-        "backdrop", "character", "portrait", "ui", "relic", "fx", "other",
-    ],
-    "labels": {
-        "character": "character/enemy",
-        "ui": "UI",
-        "fx": "FX",
-    },
-    "prefix_rules": [
-        {"prefix": "backdrop", "class": "backdrop"},
-        {"prefix": "relic", "class": "relic"},
-        {"prefix": "portrait", "class": "portrait"},
-        {"prefix": "fx-", "class": "fx"},
-        {"prefix": "vfx-", "class": "fx"},
-        {"prefix": "ui-", "class": "ui"},
-        {"prefix": "icon-", "class": "ui"},
-        {"prefix": "char-", "class": "character"},
-        {"prefix": "enemy-", "class": "character"},
-        {"prefix": "npc-", "class": "character"},
-    ],
-    "map_kinds": ["floor", "wall", "door", "prop", "decal", "rubble"],
-    "icon_suffix_class": "ui",
-    "fallback": "other",
-    "derive_class_from_asset_token": True,
+# Asset class / act derived from asset or job names (rule-based, no model).
+ASSET_CLASSES = (
+    "floor", "wall", "door", "prop", "decal", "rubble",
+    "backdrop", "character", "portrait", "ui", "relic", "fx", "other",
+)
+ASSET_CLASS_LABELS = {
+    "floor": "floor",
+    "wall": "wall",
+    "door": "door",
+    "prop": "prop",
+    "decal": "decal",
+    "rubble": "rubble",
+    "backdrop": "backdrop",
+    "character": "characters/enemies",
+    "portrait": "portraits",
+    "ui": "UI",
+    "relic": "relic",
+    "fx": "effects",
+    "other": "other",
 }
+_CHARACTER_EXACT = frozenset({
+    "mecha-fox", "turret", "echo-shade", "data-courier", "relay-pylon",
+})
+_CHARACTER_PREFIXES = ("biomech-",)
+_UI_PREFIXES = (
+    "elem-", "weapon-", "terminal-", "hexslot-", "shield-", "supply-", "tooltip-",
+)
 _ACT_RE = re.compile(r"(?:^|[-\s_/])act[_-]?(\d+)\b", re.I)
-_MAP_KIND_RE = re.compile(r"^map-act(\d+)-([a-z0-9]+)", re.I)
-_class_rules_cache: dict | None = None
-
-
-def load_class_rules() -> dict:
-    global _class_rules_cache
-    if _class_rules_cache is not None:
-        return _class_rules_cache
-    rules = dict(_DEFAULT_CLASS_RULES)
-    rules["prefix_rules"] = list(_DEFAULT_CLASS_RULES["prefix_rules"])
-    rules["labels"] = dict(_DEFAULT_CLASS_RULES["labels"])
-    rules["classes"] = list(_DEFAULT_CLASS_RULES["classes"])
-    rules["map_kinds"] = list(_DEFAULT_CLASS_RULES["map_kinds"])
-    if CLASS_RULES_PATH.exists():
-        try:
-            data = json.loads(CLASS_RULES_PATH.read_text() or "{}")
-            if isinstance(data, dict):
-                if isinstance(data.get("classes"), list) and data["classes"]:
-                    rules["classes"] = [str(c) for c in data["classes"]]
-                if isinstance(data.get("labels"), dict):
-                    rules["labels"].update({str(k): str(v) for k, v in data["labels"].items()})
-                if isinstance(data.get("prefix_rules"), list):
-                    rules["prefix_rules"] = [
-                        {"prefix": str(r.get("prefix", "")).lower(), "class": str(r.get("class", "other"))}
-                        for r in data["prefix_rules"] if isinstance(r, dict) and r.get("prefix")
-                    ]
-                if isinstance(data.get("map_kinds"), list) and data["map_kinds"]:
-                    rules["map_kinds"] = [str(k).lower() for k in data["map_kinds"]]
-                if "icon_suffix_class" in data:
-                    rules["icon_suffix_class"] = data.get("icon_suffix_class")
-                if "fallback" in data:
-                    rules["fallback"] = str(data.get("fallback") or "other")
-                if "derive_class_from_asset_token" in data:
-                    rules["derive_class_from_asset_token"] = bool(data.get("derive_class_from_asset_token"))
-        except Exception:
-            pass
-    _class_rules_cache = rules
-    return rules
-
-
-def asset_class_labels() -> dict:
-    rules = load_class_rules()
-    labels = {c: c for c in rules["classes"]}
-    labels.update(rules.get("labels") or {})
-    return labels
+_MAP_KIND_RE = re.compile(r"^map-act(\d+)-([a-z]+)", re.I)
 
 
 def classify_asset(asset: str = "", source_job: str = "", round_name: str = "") -> tuple[str, int | None]:
-    """Derive (asset_class, act) from names using configurable rules."""
-    rules = load_class_rules()
+    """Return (asset_class, act_or_None) from naming conventions."""
     name = (asset or "").strip().lower()
     blob = " ".join([name, (source_job or "").lower(), (round_name or "").lower()])
     act = None
@@ -126,49 +80,203 @@ def classify_asset(asset: str = "", source_job: str = "", round_name: str = "") 
     if mm:
         act = int(mm.group(1))
         kind = mm.group(2).lower()
-        if kind in set(rules.get("map_kinds") or []):
+        if kind in ("floor", "wall", "door", "prop", "decal", "rubble"):
             return kind, act
-        return str(rules.get("fallback") or "other"), act
-    for rule in rules.get("prefix_rules") or []:
-        prefix = (rule.get("prefix") or "").lower()
-        if prefix and name.startswith(prefix):
-            return str(rule.get("class") or rules.get("fallback") or "other"), act
-    icon_class = rules.get("icon_suffix_class")
-    if icon_class and ("-icon" in name or name.endswith("icon")):
-        return str(icon_class), act
-    known = set(rules.get("classes") or [])
-    if rules.get("derive_class_from_asset_token") and name:
-        token = name.split("-")[0]
-        if token in known:
-            return token, act
-        # If asset is like "hero-warrior", keep first token as a dynamic class only when
-        # it already appears in configured classes; otherwise fallback.
-    return str(rules.get("fallback") or "other"), act
+        return "other", act
+    if name.startswith("backdrop"):
+        return "backdrop", act
+    if name.startswith("relic"):
+        return "relic", act
+    if name.startswith("portrait") or "portrait" in name:
+        return "portrait", act
+    if name.startswith("fx-") or name.startswith("vfx-") or name.endswith("-fx"):
+        return "fx", act
+    if name in _CHARACTER_EXACT or any(name.startswith(p) for p in _CHARACTER_PREFIXES):
+        return "character", act
+    if any(name.startswith(p) for p in _UI_PREFIXES) or "-icon" in name:
+        return "ui", act
+    return "other", act
 
 
 def ensure_class_fields(entry: dict) -> dict:
+    """Fill asset_class / act on an entry if missing; mutate and return entry."""
     if not isinstance(entry, dict):
         return entry
-    rules = load_class_rules()
-    known = set(rules.get("classes") or [])
     cls = entry.get("asset_class")
-    if cls not in known:
+    act = entry.get("act")
+    if cls not in ASSET_CLASSES or (act is None and "act" not in entry):
         derived_cls, derived_act = classify_asset(
             entry.get("asset") or "",
             entry.get("source_job") or "",
             entry.get("round") or "",
         )
-        entry["asset_class"] = derived_cls
+        if cls not in ASSET_CLASSES:
+            entry["asset_class"] = derived_cls
         if "act" not in entry:
             entry["act"] = derived_act
-    elif "act" not in entry:
-        _, derived_act = classify_asset(
-            entry.get("asset") or "",
-            entry.get("source_job") or "",
-            entry.get("round") or "",
-        )
-        entry["act"] = derived_act
     return entry
+
+
+def archive_reject_hours() -> int:
+    """Hours before a reject moves to archived. Config key archive_reject_hours, default 24."""
+    cfg = load_config()
+    try:
+        v = cfg.get("archive_reject_hours")
+        if v is not None:
+            return max(1, int(v))
+    except Exception:
+        pass
+    env = os.environ.get("GALLERY_ARCHIVE_REJECT_HOURS")
+    if env:
+        try:
+            return max(1, int(env))
+        except Exception:
+            pass
+    return 24
+
+
+def is_recently_rejected(entry: dict) -> bool:
+    if entry.get("status") != "rejected":
+        return False
+    ts = parse_iso(entry.get("rejected_at") or entry.get("reviewed_at") or "")
+    if not ts:
+        return False
+    hours = archive_reject_hours()
+    return datetime.now(timezone.utc) - ts.astimezone(timezone.utc) <= timedelta(hours=hours)
+
+
+def opaque_fraction(path: Path) -> float | None:
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("RGBA")
+        px = im.getdata()
+        step = max(1, len(px) // 4000)
+        vals = [px[i] for i in range(0, len(px), step)]
+        if not vals:
+            return 0.0
+        return sum(1 for p in vals if p[3] > 10) / len(vals)
+    except Exception:
+        return None
+
+
+def make_checker(size: int):
+    from PIL import Image
+    tile = 8
+    im = Image.new("RGB", (size, size), (24, 28, 32))
+    px = im.load()
+    for y in range(size):
+        for x in range(size):
+            if ((x // tile) + (y // tile)) % 2 == 0:
+                px[x, y] = (40, 44, 48)
+    return im
+
+
+def ensure_thumb(entry: dict, force: bool = False) -> str:
+    """Ensure a <=THUMB_MAX webp thumb exists; composite transparent tiles on checker."""
+    from PIL import Image
+    sp = Path(entry.get("spark_path") or "")
+    if not sp.is_file():
+        return entry.get("thumb_path") or ""
+    tp = Path(entry.get("thumb_path") or "")
+    round_dir = sp.parent
+    thumb_dir = round_dir / "thumbs"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+    cache = thumb_dir / (sp.stem + "_t" + str(THUMB_MAX) + ".webp")
+    if cache.is_file() and not force:
+        entry["thumb_path"] = str(cache)
+        return str(cache)
+    if tp.is_file() and not force:
+        try:
+            with Image.open(tp) as im:
+                # reuse small thumbs that already have content; still prefer checker cache for sparse tiles
+                if max(im.size) <= THUMB_MAX + 2 and opaque_fraction(tp) not in (None, 0.0) and (opaque_fraction(tp) or 0) >= 0.02:
+                    entry["thumb_path"] = str(tp)
+                    return str(tp)
+        except Exception:
+            pass
+    try:
+        im = Image.open(sp).convert("RGBA")
+        of = opaque_fraction(sp)
+        w, h = im.size
+        scale = min(THUMB_MAX / max(w, 1), THUMB_MAX / max(h, 1), 1.0)
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        im = im.resize((nw, nh), Image.Resampling.LANCZOS)
+        if of is not None and of < 0.98:
+            bg = make_checker(max(nw, nh)).convert("RGBA").resize((nw, nh))
+            composed = Image.alpha_composite(bg, im)
+        else:
+            composed = im
+        composed.convert("RGB").save(cache, "WEBP", quality=72, method=4)
+        entry["thumb_path"] = str(cache)
+        return str(cache)
+    except Exception as e:
+        print(f"thumb failed {sp}: {e}", flush=True)
+        return entry.get("thumb_path") or str(sp)
+
+
+def classify_empty_and_archive(entries: list) -> dict:
+    """Backfill rejected_at, archive old rejects, mark empty tiles hidden-empty. Never deletes files."""
+    stats = {"archived": 0, "hidden_empty": 0, "backfilled_rejected_at": 0, "thumbs_fixed": 0, "checked": 0}
+    hours = archive_reject_hours()
+    now = datetime.now(timezone.utc)
+    click_reject_ts: dict[str, str] = {}
+    if CLICKS.exists():
+        try:
+            with CLICKS.open("r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    payload = row.get("payload") or {}
+                    if (payload.get("action") or "").lower() != "reject":
+                        continue
+                    ts = row.get("ts") or ""
+                    ids = list(payload.get("ids") or [])
+                    if payload.get("id"):
+                        ids.append(payload.get("id"))
+                    for i in ids:
+                        if i and i not in click_reject_ts:
+                            click_reject_ts[i] = ts
+        except Exception:
+            pass
+
+    tile_classes = {"floor", "wall", "door", "decal", "rubble", "prop"}
+    changed = False
+    for entry in entries:
+        ensure_class_fields(entry)
+        if entry.get("status") in ("rejected", "archived") and not entry.get("rejected_at"):
+            ts = entry.get("reviewed_at") or click_reject_ts.get(entry.get("id") or "") or now_iso()
+            entry["rejected_at"] = ts
+            stats["backfilled_rejected_at"] += 1
+            changed = True
+        if entry.get("status") == "rejected":
+            ts = parse_iso(entry.get("rejected_at") or entry.get("reviewed_at") or "")
+            if ts and (now - ts.astimezone(timezone.utc) > timedelta(hours=hours)):
+                entry["status"] = "archived"
+                stats["archived"] += 1
+                changed = True
+        if entry.get("status") == "needs-review" and (entry.get("asset_class") in tile_classes):
+            sp = Path(entry.get("spark_path") or "")
+            if sp.is_file():
+                stats["checked"] += 1
+                of = opaque_fraction(sp)
+                if of is not None and of < EMPTY_OPAQUE_FRAC:
+                    entry["status"] = "hidden-empty"
+                    entry["empty_opaque_frac"] = round(of, 4)
+                    entry["hidden_at"] = now_iso()
+                    stats["hidden_empty"] += 1
+                    changed = True
+                else:
+                    old = entry.get("thumb_path")
+                    ensure_thumb(entry, force=False)
+                    if entry.get("thumb_path") != old:
+                        stats["thumbs_fixed"] += 1
+                        changed = True
+    if changed:
+        save_manifest(entries)
+    return stats
+
 
 
 # Prefer gallery venv segno
@@ -191,15 +299,6 @@ def parse_iso(s: str):
         return t
     except Exception:
         return None
-
-
-def is_recently_rejected(entry: dict) -> bool:
-    if entry.get("status") != "rejected":
-        return False
-    ts = parse_iso(entry.get("rejected_at") or entry.get("reviewed_at") or "")
-    if not ts:
-        return False
-    return datetime.now(timezone.utc) - ts.astimezone(timezone.utc) <= timedelta(hours=RECENT_REJECT_HOURS)
 
 
 def load_manifest() -> list:
@@ -241,7 +340,7 @@ def post_webhook(cfg: dict, payload: dict, url_override: str | None = None) -> t
         return False, "webhook not configured"
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "art-review-gallery/1.0-batch",
+        "User-Agent": "digital-veil-art-gallery/1.4-batch",
     }
     if cfg.get("key") and not url_override:
         headers["Authorization"] = f"Bearer {cfg['key']}"
@@ -482,21 +581,6 @@ def safe_under(root: Path, path: Path) -> bool:
         return False
 
 
-
-def to_art_relative(path: Path) -> str:
-    try:
-        return str(path.resolve().relative_to(ART_ROOT.resolve()))
-    except Exception:
-        return str(path)
-
-def art_path(value: str | Path) -> Path:
-    """Resolve a manifest path; relative paths are under ART_ROOT."""
-    path = Path(value) if value else Path()
-    if not path.is_absolute():
-        path = ART_ROOT / path
-    return path
-
-
 def magicdns_host() -> str:
     """Optional Tailscale MagicDNS hostname; falls back to localhost."""
     try:
@@ -519,14 +603,12 @@ def public_https_url() -> str:
     cfg_url = str(cfg.get("public_url") or "").strip()
     if cfg_url:
         return cfg_url if cfg_url.endswith("/") else cfg_url + "/"
-    # Local default (HTTP). Set ART_GALLERY_PUBLIC_URL when terminating TLS elsewhere.
     host = os.environ.get("ART_GALLERY_PUBLIC_HOST") or magicdns_host()
     https_port = HTTPS_PORT
     scheme = os.environ.get("ART_GALLERY_PUBLIC_SCHEME", "http")
     if scheme == "https":
         return f"https://{host}:{https_port}/"
     return f"http://{host}:{PORT}/"
-
 
 def qr_png_bytes(url: str) -> bytes:
     try:
@@ -557,8 +639,8 @@ def status_dir(status: str) -> Path:
 
 
 def move_entry_files(entry: dict, new_status: str) -> None:
-    """Move image + thumb into status/<round>/…; update paths. Sources stay put."""
-    sp = art_path(entry.get("spark_path") or "")
+    """Move spark + thumb into status/<round>/…; update paths. Sources stay put."""
+    sp = Path(entry.get("spark_path") or "")
     if not sp.exists() or not sp.is_file():
         return
     round_name = entry.get("round") or "misc"
@@ -570,11 +652,11 @@ def move_entry_files(entry: dict, new_status: str) -> None:
             if dest.exists():
                 dest.unlink()
             sp.replace(dest)
-            entry["spark_path"] = to_art_relative(dest)
+            entry["spark_path"] = str(dest)
         except Exception as e:
-            print(f"move image failed {sp} -> {dest}: {e}", flush=True)
+            print(f"move spark failed {sp} -> {dest}: {e}", flush=True)
             return
-    tp = art_path(entry.get("thumb_path") or "")
+    tp = Path(entry.get("thumb_path") or "")
     if tp.exists() and tp.is_file():
         thumb_dir = dest_root / "thumbs"
         thumb_dir.mkdir(parents=True, exist_ok=True)
@@ -584,7 +666,7 @@ def move_entry_files(entry: dict, new_status: str) -> None:
                 if tdest.exists():
                     tdest.unlink()
                 tp.replace(tdest)
-            entry["thumb_path"] = to_art_relative(tdest)
+            entry["thumb_path"] = str(tdest)
         except Exception as e:
             print(f"move thumb failed {tp} -> {tdest}: {e}", flush=True)
 
@@ -759,15 +841,28 @@ textarea{min-height:56px;resize:vertical;}
 .clear-sel{background:#12301a;color:var(--muted);border:1px solid var(--line);}
 .foot{text-align:center;color:var(--muted);font-size:11px;}
 
-.filter-row{display:flex;flex-direction:column;gap:6px;margin-top:4px;}
+.filter-row{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px;align-items:flex-end;}
+.filter-field{display:flex;flex-direction:column;gap:4px;min-width:140px;flex:1;}
 .filter-label{font-size:11px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase;}
-.filter-chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
-.fchip{appearance:none;cursor:pointer;border:1px solid #1a2e1a;background:#0a120c;color:#5a7a5a;
-  font:700 11px/1 var(--mono);letter-spacing:.03em;text-transform:uppercase;padding:10px 12px;border-radius:4px;
-  text-align:center;white-space:nowrap;min-height:44px;min-width:44px;
-  display:inline-flex;align-items:center;justify-content:center;}
-.fchip.on{color:#041204;background:var(--cyan);border-color:var(--cyan);}
-.fchip.dim{opacity:.55;}
+.filter-select{appearance:none;cursor:pointer;border:2px solid var(--line-strong);background:#0a120c;color:var(--green-bright);
+  font:700 14px/1.2 var(--mono);padding:12px 14px;border-radius:6px;min-height:48px;width:100%;
+  background-image:linear-gradient(45deg,transparent 50%,var(--cyan) 50%),linear-gradient(135deg,var(--cyan) 50%,transparent 50%);
+  background-position:calc(100% - 18px) calc(50% - 3px),calc(100% - 12px) calc(50% - 3px);
+  background-size:6px 6px,6px 6px;background-repeat:no-repeat;padding-right:32px;}
+.pager{display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;margin-top:8px;}
+.page-btn{appearance:none;cursor:pointer;border:2px solid var(--line-strong);background:#0a120c;color:var(--green-bright);
+  font:800 14px/1 var(--mono);padding:12px 18px;border-radius:6px;min-height:48px;min-width:88px;}
+.page-btn:disabled{opacity:.35;cursor:not-allowed;}
+.page-meta{color:var(--muted);font-size:12px;}
+.card .actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
+.card .actions .steer{grid-column:1/-1;}
+.card .actions button{min-height:44px;font-size:13px;font-weight:800;padding:10px 8px;}
+.card img{background:
+  linear-gradient(45deg,#1a1f22 25%,transparent 25%),
+  linear-gradient(-45deg,#1a1f22 25%,transparent 25%),
+  linear-gradient(45deg,transparent 75%,#1a1f22 75%),
+  linear-gradient(-45deg,transparent 75%,#1a1f22 75%);
+  background-size:16px 16px;background-position:0 0,0 8px,8px -8px,-8px 0;background-color:#0b0e10;}
 """
 
 DESKTOP_EXTRA = r"""
@@ -808,14 +903,17 @@ body{padding-left:max(1vw, var(--safe-l)); padding-right:max(1vw, var(--safe-r))
 .legend{font-size:13px; margin-top:6px;}
 .meta{font-size:13px;}
 .filter-label{font-size:13px;}
-.fchip{font-size:16px; line-height:1.15; font-weight:800; min-height:48px; padding:12px 16px; border-radius:6px;}
+.filter-select{font-size:16px; min-height:52px; padding:14px 16px;}
+.card .actions button{font-size:15px; min-height:48px;}
 """
 
 MOBILE_EXTRA = r"""
 .cluster{max-width:480px;}
 .grid{grid-template-columns:1fr 1fr;gap:8px;}
-.card .body .actions,.card .body .note-row{display:none;} /* review in sheet */
+.card .body .actions{display:grid;} /* per-card Reject/Steer restored */
 .card .sel-row{min-height:36px;}
+.card .actions button{min-height:48px;font-size:14px;}
+.filter-select{min-height:52px;font-size:15px;}
 .sheet-scrim{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:40;}
 .sheet-scrim.open{display:block;}
 .sheet{
@@ -837,32 +935,57 @@ MOBILE_EXTRA = r"""
 """
 
 SHARED_JS = r"""
-const STATUS_TABS = ['needs-review','finalists','recently-rejected','approved','rejected','training','in-game','all'];
-let CLASS_ORDER = ['floor','wall','door','prop','decal','rubble','backdrop','character','portrait','ui','relic','fx','other'];
-let CLASS_LABELS = {floor:'floor',wall:'wall',door:'door',prop:'prop',decal:'decal',rubble:'rubble',backdrop:'backdrop',character:'character/enemy',portrait:'portrait',ui:'UI',relic:'relic',fx:'FX',other:'other'};
-const RECENT_MS = 48*60*60*1000;
+const STATUS_TABS = ['needs-review','finalists','recently-rejected','archived','approved','rejected','training','in-game','all'];
+const CLASS_ORDER = ['floor','wall','door','prop','decal','rubble','backdrop','character','portrait','ui','relic','fx','other'];
+const CLASS_LABELS = {floor:'floor',wall:'wall',door:'door',prop:'prop',decal:'decal',rubble:'rubble',backdrop:'backdrop',character:'characters/enemies',portrait:'portraits',ui:'UI',relic:'relic',fx:'effects',other:'other'};
+const STATUS_DROP_OPTS = [
+  {v:'all', label:'all'},
+  {v:'needs-review', label:'unreviewed'},
+  {v:'training', label:'steered'},
+  {v:'rejected', label:'rejected'},
+  {v:'recently-rejected', label:'recently rejected'},
+  {v:'finalist', label:'finalist'},
+  {v:'archived', label:'archived'},
+  {v:'hidden-empty', label:'hidden empty'},
+];
+const PER_PAGE_OPTS = [10,25,50,100];
+const ARCHIVE_REJECT_HOURS = (window.__ARCHIVE_REJECT_HOURS__|0) || 24;
+const RECENT_MS = ARCHIVE_REJECT_HOURS*60*60*1000;
 let current = 'needs-review';
 let classFilter = 'all';
 let actFilter = 'all';
+let statusDrop = 'all';
+let pageNum = 1;
+let perPage = IS_MOBILE_DEFAULT();
 let items = [];
 let configured = false;
 let classCounts = {};
 let actCounts = {};
+let statusDropCounts = {};
 const selected = new Set();
 let undoState = null;
 const IS_MOBILE = !!window.__MOBILE__;
+
+function IS_MOBILE_DEFAULT(){ return (window.__MOBILE__ || (window.matchMedia && matchMedia('(max-width:720px)').matches)) ? 10 : 50; }
 
 function readQuery(){
   const q=new URLSearchParams(location.search);
   const st=q.get('status'); if(st && STATUS_TABS.includes(st)) current=st;
   const cl=q.get('class'); if(cl) classFilter=cl;
   const ac=q.get('act'); if(ac) actFilter=ac;
+  const sd=q.get('status_drop'); if(sd) statusDrop=sd;
+  const pp=parseInt(q.get('per_page')||'',10); if(PER_PAGE_OPTS.includes(pp)) perPage=pp;
+  else perPage=IS_MOBILE_DEFAULT();
+  const pg=parseInt(q.get('page')||'1',10); pageNum=Number.isFinite(pg)&&pg>0?pg:1;
 }
 function writeQuery(){
   const q=new URLSearchParams();
   if(current && current!=='needs-review') q.set('status', current);
   if(classFilter && classFilter!=='all') q.set('class', classFilter);
   if(actFilter && actFilter!=='all') q.set('act', actFilter);
+  if(statusDrop && statusDrop!=='all') q.set('status_drop', statusDrop);
+  if(perPage !== IS_MOBILE_DEFAULT()) q.set('per_page', String(perPage));
+  if(pageNum>1) q.set('page', String(pageNum));
   const qs=q.toString();
   const next=location.pathname+(qs?('?'+qs):'');
   if(next!==location.pathname+location.search) history.replaceState(null,'',next);
@@ -872,35 +995,45 @@ readQuery();
 function parseTs(s){ if(!s) return null; const d=new Date(s); return isNaN(d)?null:d; }
 function isRecentlyRejected(it){
   if(it.status!=='rejected') return false;
-  const d=parseTs(it.rejected_at||it.reviewed_at); if(!d) return false;
-  return (Date.now()-d.getTime())<=RECENT_MS;
+  const t=parseTs(it.rejected_at||it.reviewed_at); if(!t) return false;
+  return (Date.now()-t.getTime())<=RECENT_MS;
 }
 function toast(msg, undo){
-  const t=document.getElementById('toast');
-  const msgEl=document.getElementById('toastMsg');
-  const undoBtn=document.getElementById('toastUndo');
-  msgEl.textContent=msg; t.classList.add('show');
-  clearTimeout(toast._tm); undoState=undo||null;
-  if(undo){
-    undoBtn.style.display='';
-    undoBtn.onclick=async()=>{ try{ await runUndo(undo); toast('Undone'); }catch(e){ toast('Undo failed: '+e.message);} };
-  } else { undoBtn.style.display='none'; undoBtn.onclick=null; }
-  toast._tm=setTimeout(()=>{ t.classList.remove('show'); undoState=null; }, undo?5000:2200);
+  const el=document.getElementById('toast'); const m=document.getElementById('toastMsg');
+  const u=document.getElementById('toastUndo');
+  m.textContent=msg; undoState=undo||null;
+  u.style.display=undo?'inline-block':'none';
+  el.classList.add('show'); clearTimeout(toast._t);
+  toast._t=setTimeout(()=>el.classList.remove('show'), undo?8000:3200);
 }
-async function runUndo(u){
-  await api('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({action:'undo',ids:u.ids,paths:u.paths,note:'',destination:''})});
-  selected.clear(); await load();
-}
+document.addEventListener('click',e=>{
+  if(e.target && e.target.id==='toastUndo' && undoState){
+    const {ids,paths}=undoState; undoState=null;
+    api('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'unreject',ids,paths})}).then(()=>load()).catch(err=>toast('Undo failed: '+err.message));
+  }
+});
 async function api(path, opts){
   const r=await fetch(path, opts); const j=await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(j.error||r.statusText); return j;
 }
 function statusMatch(it){
-  if(current==='all') return true;
+  if(current==='all') return it.status!=='hidden-empty';
   if(current==='recently-rejected') return isRecentlyRejected(it);
   if(current==='finalists') return it.status==='finalist';
+  if(current==='rejected') return it.status==='rejected' && !isRecentlyRejected(it);
   return it.status===current;
+}
+function statusDropMatch(it){
+  if(statusDrop==='all') return true;
+  if(statusDrop==='recently-rejected') return isRecentlyRejected(it);
+  if(statusDrop==='needs-review') return it.status==='needs-review';
+  if(statusDrop==='training') return it.status==='training';
+  if(statusDrop==='rejected') return it.status==='rejected';
+  if(statusDrop==='finalist') return it.status==='finalist';
+  if(statusDrop==='archived') return it.status==='archived';
+  if(statusDrop==='hidden-empty') return it.status==='hidden-empty';
+  return true;
 }
 function classMatch(it){
   if(classFilter==='all') return true;
@@ -912,45 +1045,64 @@ function actMatch(it){
   return String(it.act)===String(actFilter);
 }
 function visibleItems(){
-  return items.filter(it=>statusMatch(it) && classMatch(it) && actMatch(it));
+  return items.filter(it=>statusMatch(it) && classMatch(it) && actMatch(it) && statusDropMatch(it));
+}
+function pagedItems(){
+  const list=visibleItems();
+  const pages=Math.max(1, Math.ceil(list.length/perPage));
+  if(pageNum>pages) pageNum=pages;
+  if(pageNum<1) pageNum=1;
+  const start=(pageNum-1)*perPage;
+  return {list, page:list.slice(start, start+perPage), pages, start, total:list.length};
 }
 function recountFilters(){
-  classCounts={}; actCounts={all:0};
+  classCounts={}; actCounts={all:0}; statusDropCounts={all:0};
+  // Class counts: within current tab + act + statusDrop filters (not class)
   for(const it of items){
-    if(!statusMatch(it)) continue;
+    if(!statusMatch(it) || !actMatch(it) || !statusDropMatch(it)) continue;
     const c=it.asset_class||'other';
     classCounts[c]=(classCounts[c]||0)+1;
-    actCounts.all+=1;
-    if(it.act==null || it.act==='' || typeof it.act==='undefined'){
-      actCounts.none=(actCounts.none||0)+1;
-    } else {
-      const k=String(it.act);
-      actCounts[k]=(actCounts[k]||0)+1;
-    }
+  }
+  // Act counts: within tab + class + statusDrop
+  for(const it of items){
+    if(!statusMatch(it) || !classMatch(it) || !statusDropMatch(it)) continue;
+    actCounts.all=(actCounts.all||0)+1;
+    if(it.act==null || it.act==='' || typeof it.act==='undefined') actCounts.none=(actCounts.none||0)+1;
+    else { const k=String(it.act); actCounts[k]=(actCounts[k]||0)+1; }
+  }
+  // Status-drop counts: within tab + class + act
+  for(const it of items){
+    if(!statusMatch(it) || !classMatch(it) || !actMatch(it)) continue;
+    statusDropCounts.all=(statusDropCounts.all||0)+1;
+    const key = it.status==='needs-review'?'needs-review'
+      : it.status==='training'?'training'
+      : isRecentlyRejected(it)?'recently-rejected'
+      : it.status==='rejected'?'rejected'
+      : it.status==='finalist'?'finalist'
+      : it.status==='archived'?'archived'
+      : it.status==='hidden-empty'?'hidden-empty'
+      : it.status;
+    statusDropCounts[key]=(statusDropCounts[key]||0)+1;
   }
 }
 function updateSelUI(){
   const n=selected.size;
   document.getElementById('selCount').textContent=n+' selected';
-  const recentMode=current==='recently-rejected';
-  const finalistMode=current==='finalists';
-  const showReview=!recentMode && !finalistMode;
   ['bulkApprove','bulkReject','bulkSteer'].forEach(id=>{
-    const el=document.getElementById(id); if(!el) return;
-    el.style.display=showReview?'':'none'; el.disabled=n===0;
+    const el=document.getElementById(id); if(el) el.disabled=!n;
   });
   const bn=document.getElementById('bulkNoteBtn'); const bu=document.getElementById('bulkUnreject');
-  if(bn){ bn.style.display=recentMode?'':'none'; bn.disabled=n===0; }
-  if(bu){ bu.style.display=recentMode?'':'none'; bu.disabled=n===0; }
+  if(bn) bn.disabled=!n; if(bu) bu.disabled=!n;
   const bf=document.getElementById('bulkFinal'); const bb=document.getElementById('bulkBack');
-  if(bf){ bf.style.display=finalistMode?'':'none'; bf.disabled=n===0; }
-  if(bb){ bb.style.display=finalistMode?'':'none'; bb.disabled=n===0; }
-  const vis=visibleItems();
-  const box=document.getElementById('selectAll');
-  const allOn=vis.length>0 && vis.every(i=>selected.has(i.id));
-  box.checked=allOn; box.indeterminate=!allOn && vis.some(i=>selected.has(i.id));
+  if(bf){ bf.disabled=!n; bf.style.display=current==='finalists'?'':'none'; }
+  if(bb){ bb.disabled=!n; bb.style.display=current==='finalists'?'':'none'; }
+  const sa=document.getElementById('selectAll');
+  if(sa){
+    const page=pagedItems().page;
+    sa.checked=page.length>0 && page.every(it=>selected.has(it.id));
+  }
 }
-function toggleSelect(id,on){
+function toggleSelect(id, on){
   if(on) selected.add(id); else selected.delete(id);
   const card=document.querySelector('.card[data-id="'+CSS.escape(id)+'"]');
   if(card){ card.classList.toggle('selected',selected.has(id));
@@ -958,70 +1110,117 @@ function toggleSelect(id,on){
   updateSelUI();
 }
 function tabLabel(s){
-  if(s==='recently-rejected') return 'Recently rejected';
+  if(s==='needs-review') return 'Needs review';
   if(s==='finalists') return 'Finalists';
-  return s;
+  if(s==='recently-rejected') return 'Recently rejected';
+  if(s==='hidden-empty') return 'Hidden empty';
+  return s.charAt(0).toUpperCase()+s.slice(1);
 }
 function renderTabs(){
   const tabs=document.getElementById('tabs'); tabs.innerHTML='';
   for(const s of STATUS_TABS){
     const b=document.createElement('button');
     b.className='rtab'+(s===current?' on':'')+(s==='recently-rejected'?' recent':'');
-    const base = s==='all'?items: s==='recently-rejected'?items.filter(isRecentlyRejected): s==='finalists'?items.filter(i=>i.status==='finalist'): items.filter(i=>i.status===s);
-    const count = base.filter(it=>classMatch(it)&&actMatch(it)).length;
+    const base = s==='all'?items.filter(i=>i.status!=='hidden-empty')
+      : s==='recently-rejected'?items.filter(isRecentlyRejected)
+      : s==='finalists'?items.filter(i=>i.status==='finalist')
+      : s==='rejected'?items.filter(i=>i.status==='rejected'&&!isRecentlyRejected(i))
+      : items.filter(i=>i.status===s);
+    const count = base.filter(it=>classMatch(it)&&actMatch(it)&&statusDropMatch(it)).length;
     b.textContent=`${tabLabel(s)} (${count})`;
-    b.onclick=()=>{ current=s; selected.clear(); writeQuery(); recountFilters(); renderTabs(); renderClassAct(); renderGrid(); updateSelUI(); };
+    b.onclick=()=>{ current=s; pageNum=1; selected.clear(); writeQuery(); recountFilters(); renderTabs(); renderFilters(); renderGrid(); updateSelUI(); };
     tabs.appendChild(b);
   }
 }
-function renderClassAct(){
+function fillSelect(sel, options, currentVal, onChange){
+  sel.innerHTML='';
+  for(const opt of options){
+    const o=document.createElement('option');
+    o.value=opt.v; o.textContent=opt.label;
+    if(String(opt.v)===String(currentVal)) o.selected=true;
+    sel.appendChild(o);
+  }
+  sel.onchange=()=>onChange(sel.value);
+}
+function renderFilters(){
   recountFilters();
-  const classRow=document.getElementById('classChips');
-  const actRow=document.getElementById('actChips');
-  if(!classRow||!actRow) return;
-  classRow.innerHTML='';
-  const allClass=document.createElement('button');
-  allClass.type='button';
-  const allClassCount=Object.values(classCounts).reduce((a,b)=>a+b,0);
-  allClass.className='fchip'+(classFilter==='all'?' on':'');
-  allClass.textContent=`all (${allClassCount})`;
-  allClass.onclick=()=>{ classFilter='all'; selected.clear(); writeQuery(); renderTabs(); renderClassAct(); renderGrid(); updateSelUI(); };
-  classRow.appendChild(allClass);
-  const order = CLASS_ORDER.slice();
-  for(const c of Object.keys(classCounts)){ if(!order.includes(c)) order.push(c); }
-  for(const c of order){
+  const classSel=document.getElementById('filterClass');
+  const actSel=document.getElementById('filterAct');
+  const statusSel=document.getElementById('filterStatus');
+  const perSel=document.getElementById('filterPerPage');
+  if(!classSel||!actSel||!statusSel) return;
+  const classOpts=[{v:'all', label:`all (${Object.values(classCounts).reduce((a,b)=>a+b,0)})`}];
+  for(const c of CLASS_ORDER){
     const n=classCounts[c]||0;
     if(n===0 && classFilter!==c) continue;
-    const b=document.createElement('button');
-    b.type='button';
-    b.className='fchip'+(classFilter===c?' on':'')+(n===0?' dim':'');
-    b.textContent=`${CLASS_LABELS[c]||c} (${n})`;
-    b.onclick=()=>{ classFilter=c; selected.clear(); writeQuery(); renderTabs(); renderClassAct(); renderGrid(); updateSelUI(); };
-    classRow.appendChild(b);
+    classOpts.push({v:c, label:`${CLASS_LABELS[c]||c} (${n})`});
   }
-  actRow.innerHTML='';
-  const acts=['all',...Object.keys(actCounts).filter(k=>k!=='all'&&k!=='none').sort((a,b)=>Number(a)-Number(b))];
-  if(actCounts.none) acts.push('none');
-  for(const a of acts){
-    const n = a==='all' ? (actCounts.all||0) : (actCounts[a]||0);
-    if(a!=='all' && n===0 && actFilter!==a) continue;
-    const b=document.createElement('button');
-    b.type='button';
-    b.className='fchip'+(String(actFilter)===String(a)?' on':'')+(n===0?' dim':'');
-    b.textContent = a==='all' ? `all (${n})` : (a==='none' ? `no act (${n})` : `act ${a} (${n})`);
-    b.onclick=()=>{ actFilter=a; selected.clear(); writeQuery(); renderTabs(); renderClassAct(); renderGrid(); updateSelUI(); };
-    actRow.appendChild(b);
+  fillSelect(classSel, classOpts, classFilter, v=>{ classFilter=v; pageNum=1; selected.clear(); writeQuery(); renderTabs(); renderFilters(); renderGrid(); updateSelUI(); });
+
+  const actOpts=[{v:'all', label:`all (${actCounts.all||0})`}];
+  for(const a of Object.keys(actCounts).filter(k=>k!=='all'&&k!=='none').sort((a,b)=>Number(a)-Number(b))){
+    actOpts.push({v:a, label:`Act ${a} (${actCounts[a]||0})`});
+  }
+  if(actCounts.none) actOpts.push({v:'none', label:`No act (${actCounts.none})`});
+  fillSelect(actSel, actOpts, actFilter, v=>{ actFilter=v; pageNum=1; selected.clear(); writeQuery(); renderTabs(); renderFilters(); renderGrid(); updateSelUI(); });
+
+  const stOpts=STATUS_DROP_OPTS.map(o=>{
+    const n = o.v==='all' ? (statusDropCounts.all||0) : (statusDropCounts[o.v]||0);
+    return {v:o.v, label:`${o.label} (${n})`};
+  }).filter(o=>o.v==='all' || (statusDropCounts[o.v]||0)>0 || statusDrop===o.v);
+  fillSelect(statusSel, stOpts, statusDrop, v=>{ statusDrop=v; pageNum=1; selected.clear(); writeQuery(); renderTabs(); renderFilters(); renderGrid(); updateSelUI(); });
+
+  if(perSel){
+    fillSelect(perSel, PER_PAGE_OPTS.map(n=>({v:String(n), label:String(n)+'/page'})), String(perPage), v=>{
+      perPage=parseInt(v,10)||IS_MOBILE_DEFAULT(); pageNum=1; writeQuery(); renderGrid(); updateSelUI();
+    });
   }
 }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function renderPager(pages, total){
+  const pager=document.getElementById('pager'); if(!pager) return;
+  if(pages<=1 && total<=perPage){ pager.innerHTML=''; return; }
+  pager.innerHTML=`
+    <button type="button" class="page-btn" id="pagePrev" ${pageNum<=1?'disabled':''}>Prev</button>
+    <span class="page-meta">Page ${pageNum} / ${pages} · ${total} items</span>
+    <button type="button" class="page-btn" id="pageNext" ${pageNum>=pages?'disabled':''}>Next</button>`;
+  const prev=document.getElementById('pagePrev'); const next=document.getElementById('pageNext');
+  if(prev) prev.onclick=()=>{ if(pageNum>1){ pageNum--; writeQuery(); renderGrid(); updateSelUI(); window.scrollTo(0,0);} };
+  if(next) next.onclick=()=>{ if(pageNum<pages){ pageNum++; writeQuery(); renderGrid(); updateSelUI(); window.scrollTo(0,0);} };
+}
+function cardActionsHtml(it, mode){
+  if(mode==='recent'){
+    return `<div class="actions">
+      <button type="button" class="unreject" data-act="unreject" data-id="${it.id}">Undo reject</button>
+      <button type="button" class="note-btn" data-act="note" data-id="${it.id}">Save note</button>
+    </div>
+    <div class="note-row"><textarea class="item-note" data-id="${it.id}" placeholder="Reject note (optional)">${escapeHtml(it.note||'')}</textarea></div>`;
+  }
+  if(mode==='finalist'){
+    return `<div class="actions">
+      <button type="button" class="pick-final" data-act="final" data-id="${it.id}">Pick as final</button>
+      <button type="button" class="back-review" data-act="back-to-review" data-id="${it.id}">Back to review</button>
+    </div>`;
+  }
+  return `<div class="actions">
+    <button type="button" class="approve" data-act="finalist" data-id="${it.id}">Finalist</button>
+    <button type="button" class="reject" data-act="reject" data-id="${it.id}">Reject</button>
+    <button type="button" class="steer" data-act="steer" data-id="${it.id}">Steer</button>
+  </div>
+  <div class="note-row">
+    <textarea class="item-note" data-id="${it.id}" placeholder="Note (optional)">${escapeHtml(it.note||'')}</textarea>
+    <div class="row-btns"><button type="button" class="note-btn" data-act="note" data-id="${it.id}">Save note</button></div>
+  </div>`;
+}
 function renderGrid(){
   const grid=document.getElementById('grid'); const empty=document.getElementById('empty');
-  grid.innerHTML=''; const list=visibleItems();
-  empty.style.display=list.length?'none':'block';
+  grid.innerHTML='';
+  const {list, page, pages, total}=pagedItems();
+  empty.style.display=total?'none':'block';
   const recentMode=current==='recently-rejected';
   const finalistMode=current==='finalists';
   let lastAsset=null;
-  const ordered=finalistMode?[...list].sort((a,b)=>String(a.asset||'').localeCompare(String(b.asset||''))||String(a.id).localeCompare(String(b.id))):list;
+  const ordered=finalistMode?[...page].sort((a,b)=>String(a.asset||'').localeCompare(String(b.asset||''))||String(a.id).localeCompare(String(b.id))):page;
   for(const it of ordered){
     if(finalistMode){
       const a=it.asset||'unknown';
@@ -1037,61 +1236,29 @@ function renderGrid(){
     card.className='card'+(selected.has(it.id)?' selected':'');
     card.dataset.id=it.id;
     const label=it.label||((it.asset||'')+' · '+(it.round||''));
-    if(recentMode && !IS_MOBILE){
-      card.innerHTML=`
-        <img loading="lazy" src="${it.thumb_url}" alt="${it.id}" data-full="${it.image_url}"/>
-        <div class="body">
-          <div class="round">${escapeHtml(label)}</div>
-          <div class="id">${it.cell||''} ${it.key?'('+it.key+')':''}<br/>${it.id}<br/>rejected ${it.rejected_at||''}</div>
-          ${it.note?`<div class="existing-note">Note: ${escapeHtml(it.note)}</div>`:''}
-          <div class="sel-row"><input class="selbox" type="checkbox" ${selected.has(it.id)?'checked':''} aria-label="Select ${it.id}"/></div>
-          <div class="note-row">
-            <textarea class="item-note" data-id="${it.id}" placeholder="Reject note (optional)">${escapeHtml(it.note||'')}</textarea>
-            <div class="row-btns">
-              <button type="button" class="note-btn" data-act="note" data-id="${it.id}">Save note</button>
-              <button type="button" class="unreject" data-act="unreject" data-id="${it.id}">Un-reject</button>
-            </div>
-          </div>
-        </div>`;
-    } else if(finalistMode && !IS_MOBILE){
-      card.innerHTML=`
-        <img loading="lazy" src="${it.thumb_url}" alt="${it.id}" data-full="${it.image_url}"/>
-        <div class="body">
-          <div class="round">${escapeHtml(label)}</div>
-          <div class="id">${it.cell||''} ${it.key?'('+it.key+')':''}<br/>${it.id}</div>
-          <div class="sel-row"><input class="selbox" type="checkbox" ${selected.has(it.id)?'checked':''} aria-label="Select ${it.id}"/></div>
-          <div class="actions">
-            <button type="button" class="pick-final" data-act="final" data-id="${it.id}">Pick as final</button>
-            <button type="button" class="back-review" data-act="back-to-review" data-id="${it.id}">Back to review</button>
-          </div>
-        </div>`;
-    } else {
-      card.innerHTML=`
-        <img loading="lazy" src="${it.thumb_url}" alt="${it.id}" data-full="${it.image_url}"/>
-        <div class="body">
-          <div class="round">${escapeHtml(label)}</div>
-          <div class="id">${it.cell||''} ${it.key?'('+it.key+')':''}<br/>${it.id}</div>
-          <div class="sel-row"><input class="selbox" type="checkbox" ${selected.has(it.id)?'checked':''} aria-label="Select ${it.id}"/></div>
-          <div class="actions">
-            <button type="button" class="approve" data-act="finalist" data-id="${it.id}">Finalist</button>
-            <button type="button" class="reject" data-act="reject" data-id="${it.id}">Reject</button>
-            <button type="button" class="steer" data-act="steer" data-id="${it.id}">Steer this direction</button>
-          </div>
-        </div>`;
-    }
+    const mode=recentMode?'recent':(finalistMode?'finalist':'review');
+    card.innerHTML=`
+      <img loading="lazy" decoding="async" width="256" height="256" src="${it.thumb_url}" alt="${escapeHtml(it.id)}" data-full="${it.image_url}"/>
+      <div class="body">
+        <div class="round">${escapeHtml(label)}</div>
+        <div class="id">${it.cell||''} ${it.key?'('+it.key+')':''}<br/>${escapeHtml(it.id)}${recentMode?('<br/>rejected '+(it.rejected_at||'')):''}</div>
+        ${it.note&&recentMode?`<div class="existing-note">Note: ${escapeHtml(it.note)}</div>`:''}
+        <div class="sel-row"><input class="selbox" type="checkbox" ${selected.has(it.id)?'checked':''} aria-label="Select ${escapeHtml(it.id)}"/></div>
+        ${cardActionsHtml(it, mode)}
+      </div>`;
     const cb=card.querySelector('.selbox');
     cb.addEventListener('click',e=>{ e.stopPropagation(); toggleSelect(it.id, cb.checked); });
     const img=card.querySelector('img');
     img.addEventListener('click',e=>{
       e.preventDefault();
-      if(IS_MOBILE){ openSheet(ordered.findIndex(x=>x.id===it.id)); return; }
-      if(e.detail>=2){ /* desktop zoom unused */ return; }
+      if(IS_MOBILE){ openSheet(list.findIndex(x=>x.id===it.id)); return; }
       toggleSelect(it.id, !selected.has(it.id));
     });
     grid.appendChild(card);
   }
+  renderPager(pages, total);
   document.getElementById('meta').textContent=
-    `${items.length} total · showing ${list.length} · webhook ${configured?'ready':'not configured'}`;
+    `${items.length} total · ${total} match · page ${pageNum}/${pages} (${perPage}/page) · webhook ${configured?'ready':'not configured'}`;
   updateSelUI();
 }
 async function doAction(action,id){
@@ -1170,7 +1337,7 @@ function wire(){
     e.stopPropagation(); doAction(btn.dataset.act, btn.dataset.id);
   });
   document.getElementById('selectAll').addEventListener('change',e=>{
-    const on=e.target.checked; for(const it of visibleItems()) toggleSelect(it.id,on);
+    const on=e.target.checked; for(const it of pagedItems().page) toggleSelect(it.id,on);
   });
   document.getElementById('clearSel').onclick=()=>{
     selected.clear();
@@ -1211,19 +1378,19 @@ function wire(){
 async function load(){
   const data=await api('/api/items');
   items=data.items||[]; configured=!!data.configured;
-  if(data.class_labels) CLASS_LABELS=Object.assign({}, CLASS_LABELS, data.class_labels);
-  if(Array.isArray(data.class_order) && data.class_order.length) CLASS_ORDER=data.class_order.slice();
   for(const id of [...selected]){ if(!items.some(i=>i.id===id)) selected.delete(id); }
   document.getElementById('banner').classList.toggle('show', !configured);
-  recountFilters(); renderTabs(); renderClassAct(); renderGrid();
+  recountFilters(); renderTabs(); renderFilters(); renderGrid();
 }
 wire(); load(); setInterval(load, 30000);
+
 """
 
 
 def page(mobile: bool) -> str:
     https = public_https_url()
     mode = "true" if mobile else "false"
+    hours = archive_reject_hours()
     link_other = '<a class="desk-link" href="/">Desktop</a>' if mobile else '<a class="desk-link" href="/m">Mobile</a>'
     extra = MOBILE_EXTRA if mobile else DESKTOP_EXTRA
     sheet = ""
@@ -1244,7 +1411,7 @@ def page(mobile: bool) -> str:
     <button type="button" class="back-review" id="sheetBack">Back to review</button>
   </div>
 </div>"""
-    title = "Art Review Gallery" + (" · Mobile" if mobile else "")
+    title = "Digital Veil — Art Review" + (" · Mobile" if mobile else "")
     return f"""<!doctype html><html lang=en><head>
 <meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -1256,29 +1423,40 @@ def page(mobile: bool) -> str:
 <div class=cluster>
   <div class=hdr>
     <div class=hdr-top>
-      <h1>Art Review Gallery</h1>
+      <h1>Digital Veil — Art Review</h1>
       {link_other}
     </div>
     <div class="https-bar">
       <a id="httpsLink" href="{https}">{https}</a>
       <button type="button" class="copy-btn" id="copyHttps">Copy</button>
     </div>
-    <div id="banner" class="banner">Webhook not configured — clicks logged locally. Copy config.example.json to gallery/config.json and set url + key if you want remote notifications.</div>
+    <div id="banner" class="banner">Webhook not configured — clicks logged locally. Add url to gallery/config.json (key already set).</div>
     <nav class="range-tog" id="tabs" role="tablist" aria-label="Status"></nav>
-    <div class="filter-row">
-      <div class="filter-label">Class</div>
-      <div class="filter-chips" id="classChips" role="group" aria-label="Asset class"></div>
+    <div class="filter-row" id="filterRow">
+      <div class="filter-field">
+        <label class="filter-label" for="filterStatus">Status</label>
+        <select class="filter-select" id="filterStatus" aria-label="Status"></select>
+      </div>
+      <div class="filter-field">
+        <label class="filter-label" for="filterClass">By asset type</label>
+        <select class="filter-select" id="filterClass" aria-label="Asset type"></select>
+      </div>
+      <div class="filter-field">
+        <label class="filter-label" for="filterAct">By Act</label>
+        <select class="filter-select" id="filterAct" aria-label="Act"></select>
+      </div>
+      <div class="filter-field" style="max-width:140px">
+        <label class="filter-label" for="filterPerPage">Per page</label>
+        <select class="filter-select" id="filterPerPage" aria-label="Per page"></select>
+      </div>
     </div>
-    <div class="filter-row">
-      <div class="filter-label">Act</div>
-      <div class="filter-chips" id="actChips" role="group" aria-label="Act"></div>
-    </div>
-    <div class="view-controls"><label><input type="checkbox" id="selectAll"/> Select all in view</label></div>
+    <div class="view-controls"><label><input type="checkbox" id="selectAll"/> Select all on page</label></div>
     <div class="meta" id="meta"></div>
     <div class="legend"><b class="ship">Finalist</b> = shortlist · <b class="final">Pick as final</b> = ship · <b class="steer">Steer</b> = train this way · <b class="reject">Reject</b> = no</div>
   </div>
   <div class="panel">
     <div class="grid" id="grid"></div>
+    <div class="pager" id="pager"></div>
     <div class="empty" id="empty" style="display:none">No items in this filter.</div>
   </div>
   <div class="toast" id="toast"><span id="toastMsg"></span><button type="button" id="toastUndo" style="display:none">Undo</button></div>
@@ -1304,13 +1482,13 @@ def page(mobile: bool) -> str:
   <p class="foot">Sources read-only · actions apply instantly</p>
 </div>
 {sheet}
-<script>window.__MOBILE__={mode};</script>
+<script>window.__MOBILE__={mode};window.__ARCHIVE_REJECT_HOURS__={hours};</script>
 <script>{SHARED_JS}</script>
 </body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ArtGallery/1.4-filters"
+    server_version = "ArtGallery/1.5-paging"
 
     def log_message(self, fmt, *args):
         print(f"[{now_iso()}] {self.address_string()} " + (fmt % args), flush=True)
@@ -1348,7 +1526,6 @@ class Handler(BaseHTTPRequestHandler):
             for e in entries:
                 ensure_class_fields(e)
             cfg = load_config()
-            rules = load_class_rules()
             items = []
             for e in entries:
                 if status and status != "all":
@@ -1358,8 +1535,15 @@ class Handler(BaseHTTPRequestHandler):
                     elif status == "finalists":
                         if e.get("status") != "finalist":
                             continue
+                    elif status == "rejected":
+                        # non-recent rejects (recent ones live under recently-rejected)
+                        if e.get("status") != "rejected" or is_recently_rejected(e):
+                            continue
                     elif e.get("status") != status:
                         continue
+                else:
+                    # default listing still includes everything; UI hides hidden-empty on Needs review
+                    pass
                 if class_f and class_f != "all":
                     if (e.get("asset_class") or "other") != class_f:
                         continue
@@ -1379,7 +1563,7 @@ class Handler(BaseHTTPRequestHandler):
                 items.append({
                     **{k: e.get(k) for k in (
                         "id", "round", "asset", "status", "spark_path", "source_path",
-                        "source_job", "prompt", "model", "size", "added_at", "cell", "key",
+                        "source_job", "model", "size", "added_at", "cell", "key",
                         "seed", "note", "destination", "steer", "rejected_at", "reviewed_at",
                         "noted_at", "label", "asset_class", "act",
                     )},
@@ -1387,16 +1571,18 @@ class Handler(BaseHTTPRequestHandler):
                     "thumb_url": f"/file?p={quote(tp)}" if tp else f"/file?p={quote(sp)}",
                     "image_url": f"/file?p={quote(sp)}",
                 })
-            class_list = list(rules.get("classes") or [])
-            class_counts = {c: 0 for c in class_list}
+            class_counts = {c: 0 for c in ASSET_CLASSES}
             act_counts: dict = {}
             for e in entries:
                 cls = e.get("asset_class") or "other"
-                class_counts[cls] = class_counts.get(cls, 0) + 1
+                if cls not in class_counts:
+                    class_counts[cls] = 0
+                class_counts[cls] += 1
                 a = e.get("act")
                 key = "none" if a is None else str(a)
                 act_counts[key] = act_counts.get(key, 0) + 1
-            nr_class = {c: 0 for c in class_list}
+            # needs-review breakdowns for callers
+            nr_class = {c: 0 for c in ASSET_CLASSES}
             nr_act: dict = {}
             for e in entries:
                 if e.get("status") != "needs-review":
@@ -1416,14 +1602,15 @@ class Handler(BaseHTTPRequestHandler):
                 "act_counts": act_counts,
                 "needs_review_by_class": nr_class,
                 "needs_review_by_act": nr_act,
-                "class_labels": asset_class_labels(),
-                "class_order": class_list,
+                "class_labels": ASSET_CLASS_LABELS,
             })
             return
         if path == "/file":
             qs = parse_qs(parsed.query)
-            raw_p = (qs.get("p") or [""])[0]
-            p = art_path(raw_p)
+            p = Path((qs.get("p") or [""])[0])
+            if not p.is_absolute():
+                self._json(400, {"error": "absolute path required"})
+                return
             if not safe_under(ART_ROOT, p):
                 self._json(403, {"error": "path outside art root"})
                 return
@@ -1434,7 +1621,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, p.read_bytes(), ctype)
             return
         if path == "/api/health":
-            self._json(200, {"ok": True, "time": now_iso(), "port": PORT, "https_url": public_https_url()})
+            self._json(200, {"ok": True, "time": now_iso(), "port": PORT, "https_url": public_https_url(), "archive_reject_hours": archive_reject_hours()})
             return
         if path == "/api/webhook-batch":
             self._json(200, {"ok": True, "time": now_iso(), **WEBHOOK_BATCHER.status()})
@@ -1530,10 +1717,22 @@ def main():
     (ART_ROOT / "training").mkdir(parents=True, exist_ok=True)
     (ART_ROOT / "finalists").mkdir(parents=True, exist_ok=True)
     (ART_ROOT / "approved").mkdir(parents=True, exist_ok=True)
+    (ART_ROOT / "archived").mkdir(parents=True, exist_ok=True)
     if not CONFIG_PATH.exists():
         CONFIG_PATH.write_text("{}\n")
     if not CLICKS.exists():
         CLICKS.write_text("")
+    try:
+        entries = load_manifest()
+        stats = classify_empty_and_archive(entries)
+        print(
+            f"gallery startup maintenance archive_hours={archive_reject_hours()} "
+            f"archived={stats['archived']} hidden_empty={stats['hidden_empty']} "
+            f"backfilled_rejected_at={stats['backfilled_rejected_at']} thumbs_fixed={stats['thumbs_fixed']}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"startup maintenance failed: {e}", flush=True)
     WEBHOOK_BATCHER.start()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"art-gallery listening on http://{HOST}:{PORT}/  https_url={public_https_url()}  art_root={ART_ROOT}", flush=True)

@@ -13,6 +13,7 @@ gallery/clicks.*.jsonl
 gallery/webhook_cursor.json
 gallery/*.bak*
 gallery/server.py.bak*
+gallery/class_rules.json
 
 # Models / LoRAs / checkpoints (never commit)
 *.safetensors
@@ -34,6 +35,7 @@ rejected/**
 training/**
 in-game/
 feedback/**
+archived/**
 
 # OS / editor
 .DS_Store
@@ -41,4 +43,3 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
-gallery/class_rules.json
