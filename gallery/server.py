@@ -674,6 +674,24 @@ def move_entry_files(entry: dict, new_status: str) -> None:
             print(f"move thumb failed {tp} -> {tdest}: {e}", flush=True)
 
 
+
+def _style_library_ingest(entry: dict) -> None:
+    """Copy a newly approved gallery item into ~/share/art/style-library. Never fail the approve."""
+    ingest = Path.home() / "codexq/bin/style-library-ingest"
+    if not ingest.is_file():
+        return
+    try:
+        subprocess.run(
+            [str(ingest), "--from-entry", json.dumps(entry)],
+            timeout=30,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"style-library ingest failed: {e}", flush=True)
+
+
 def apply_action(entry: dict, action: str, note: str, destination: str) -> dict:
     # Legacy approve → finalist (shortlist), not ship
     if action == "approve":
@@ -698,6 +716,7 @@ def apply_action(entry: dict, action: str, note: str, destination: str) -> dict:
         if note:
             entry["note"] = note
         move_entry_files(entry, "approved")
+        _style_library_ingest(entry)
     elif action == "reject":
         entry["status"] = "rejected"
         entry["reviewed_at"] = now_iso()
