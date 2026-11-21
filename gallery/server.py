@@ -120,6 +120,49 @@ def ensure_class_fields(entry: dict) -> dict:
     return entry
 
 
+_ROUND_SUFFIX_RE = re.compile(r"-round-\d+(?:-.*)?$", re.I)
+_UI_ASSET_PREFIXES = ("icons-", "scoreboard-", "elem-", "tooltip-", "hexslot-", "terminal-")
+_ENEMY_NAME_PREFIXES = ("biomech-", "mecha-", "act1-", "act2-", "act3-", "act4-")
+_ENEMY_NAME_EXACT = frozenset({
+    "ranger-turret", "volatile-wisp", "hulking-giant", "relay-pylon",
+    "turret", "echo-shade", "data-courier", "mecha-fox",
+})
+
+
+def asset_identity(entry: dict) -> str:
+    """Stable asset key: manifest asset name, else the prefix before -round-N."""
+    a = (entry.get("asset") or "").strip()
+    if a:
+        return a
+    rnd = (entry.get("round") or "").strip()
+    if rnd:
+        m = _ROUND_SUFFIX_RE.search(rnd)
+        key = (rnd[:m.start()] if m else rnd).strip()
+        if key:
+            return key
+    return "unknown"
+
+
+def asset_group(asset_id: str, asset_class: str | None = None) -> str:
+    """Group for the Asset filter. Enemies / UI / Other from class and name."""
+    aid = (asset_id or "").strip().lower()
+    cls = (asset_class or "").strip().lower()
+    if (
+        cls == "ui"
+        or aid.startswith(_UI_ASSET_PREFIXES)
+        or "-icon" in aid
+        or aid.endswith("-digits")
+    ):
+        return "UI"
+    if (
+        cls == "character"
+        or aid.startswith(_ENEMY_NAME_PREFIXES)
+        or aid in _ENEMY_NAME_EXACT
+    ):
+        return "Enemies"
+    return "Other"
+
+
 def archive_reject_hours() -> int:
     """Hours before a reject moves to archived. Config key archive_reject_hours, default 24."""
     cfg = load_config()
@@ -989,6 +1032,11 @@ h1{margin:0;color:var(--green-bright);letter-spacing:.06em;text-transform:upperc
 .card .body{padding:8px;display:flex;flex-direction:column;gap:6px;flex:1;}
 .id{font-size:11px;color:var(--muted);word-break:break-all;}
 .round{font-size:12px;font-weight:800;color:var(--label);}
+.asset-link{appearance:none;-webkit-appearance:none;background:none;border:0;padding:4px 0;margin:0;
+  font:inherit;font-weight:800;font-size:12px;line-height:1.25;letter-spacing:.02em;
+  text-transform:none;color:var(--cyan);text-decoration:underline;text-underline-offset:2px;
+  text-align:left;cursor:pointer;min-height:28px;}
+.asset-link:hover,.asset-link:focus{color:var(--green-bright);}
 .sel-row{display:flex;justify-content:flex-end;align-items:center;min-height:40px;}
 .selbox{width:26px;height:26px;accent-color:var(--green);padding:8px;box-sizing:content-box;cursor:pointer;}
 .actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
@@ -1137,12 +1185,15 @@ const SORT_OPTS = [
   {v:'oldest', label:'Oldest first'},
 ];
 const SORT_KEY = 'art-gallery-sort';
+const ASSET_KEY = 'art-gallery-asset';
+const ASSET_GROUP_ORDER = ['Enemies','UI','Other'];
 const ARCHIVE_REJECT_HOURS = (window.__ARCHIVE_REJECT_HOURS__|0) || 24;
 const RECENT_MS = ARCHIVE_REJECT_HOURS*60*60*1000;
 let current = 'needs-review';
 let classFilter = 'all';
 let actFilter = 'all';
 let statusDrop = 'all';
+let assetFilter = 'all';
 let sortOrder = 'newest';
 let pageNum = 1;
 let perPage = IS_MOBILE_DEFAULT();
@@ -1151,6 +1202,7 @@ let configured = false;
 let classCounts = {};
 let actCounts = {};
 let statusDropCounts = {};
+let assetCounts = {};
 const selected = new Set();
 let undoState = null;
 const IS_MOBILE = !!window.__MOBILE__;
@@ -1183,17 +1235,30 @@ function readQuery(){
   else perPage=IS_MOBILE_DEFAULT();
   const pg=parseInt(q.get('page')||'1',10); pageNum=Number.isFinite(pg)&&pg>0?pg:1;
   sortOrder=readSortPref();
+  assetFilter=readAssetPref();
+}
+function readAssetPref(){
+  const q=new URLSearchParams(location.search);
+  const fromQ=(q.get('asset')||'').trim();
+  if(fromQ) return fromQ;
+  try{
+    const fromLs=(localStorage.getItem(ASSET_KEY)||'').trim();
+    if(fromLs) return fromLs;
+  }catch(e){}
+  return 'all';
 }
 function writeQuery(){
   const q=new URLSearchParams();
   if(current && current!=='needs-review') q.set('status', current);
   if(classFilter && classFilter!=='all') q.set('class', classFilter);
   if(actFilter && actFilter!=='all') q.set('act', actFilter);
+  if(assetFilter && assetFilter!=='all') q.set('asset', assetFilter);
   if(statusDrop && statusDrop!=='all') q.set('status_drop', statusDrop);
   if(sortOrder && sortOrder!=='newest') q.set('sort', sortOrder);
   if(perPage !== IS_MOBILE_DEFAULT()) q.set('per_page', String(perPage));
   if(pageNum>1) q.set('page', String(pageNum));
   try{ localStorage.setItem(SORT_KEY, sortOrder==='oldest'?'oldest':'newest'); }catch(e){}
+  try{ localStorage.setItem(ASSET_KEY, assetFilter||'all'); }catch(e){}
   const qs=q.toString();
   const next=location.pathname+(qs?('?'+qs):'');
   if(next!==location.pathname+location.search) history.replaceState(null,'',next);
@@ -1252,6 +1317,36 @@ function actMatch(it){
   if(actFilter==='none') return it.act==null || it.act==='' || typeof it.act==='undefined';
   return String(it.act)===String(actFilter);
 }
+function assetIdentity(it){
+  if(it.asset_key) return String(it.asset_key);
+  const a=String(it.asset||'').trim();
+  if(a) return a;
+  const rnd=String(it.round||'').trim();
+  if(rnd){
+    const m=rnd.match(/-round-\d+(?:-.*)?$/i);
+    const key=m?rnd.slice(0,m.index).trim():rnd;
+    if(key) return key;
+  }
+  return 'unknown';
+}
+function prettyAsset(id){
+  let s=String(id||'unknown');
+  s=s.replace(/act[-_]?(\d+)/ig, 'Act $1');
+  s=s.replace(/[-_]+/g,' ').replace(/\s+/g,' ').trim();
+  return s.replace(/\b([a-z])/g, c=>c.toUpperCase());
+}
+function assetGroupOf(it){
+  if(it.asset_group) return it.asset_group;
+  const aid=assetIdentity(it).toLowerCase();
+  const cls=String(it.asset_class||'').toLowerCase();
+  if(cls==='ui' || /^(icons|scoreboard|elem|tooltip|hexslot|terminal)-/.test(aid) || aid.indexOf('-icon')>=0 || /[-]?digits$/.test(aid)) return 'UI';
+  if(cls==='character' || /^(biomech|mecha|act[1-4])-/.test(aid) || ['ranger-turret','volatile-wisp','hulking-giant','relay-pylon','turret','echo-shade','data-courier','mecha-fox'].includes(aid)) return 'Enemies';
+  return 'Other';
+}
+function assetMatch(it){
+  if(assetFilter==='all') return true;
+  return assetIdentity(it)===assetFilter;
+}
 function createdMs(it){
   const t=parseTs(it.created_at||it.added_at);
   return t?t.getTime():0;
@@ -1282,7 +1377,7 @@ function sortFinalists(list){
   return keys.flatMap(k=>groups.get(k));
 }
 function visibleItems(){
-  const list=items.filter(it=>statusMatch(it) && classMatch(it) && actMatch(it) && statusDropMatch(it));
+  const list=items.filter(it=>statusMatch(it) && classMatch(it) && actMatch(it) && assetMatch(it) && statusDropMatch(it));
   if(current==='finalists') return sortFinalists(list);
   return sortItemsByCreated(list);
 }
@@ -1295,23 +1390,30 @@ function pagedItems(){
   return {list, page:list.slice(start, start+perPage), pages, start, total:list.length};
 }
 function recountFilters(){
-  classCounts={}; actCounts={all:0}; statusDropCounts={all:0};
-  // Class counts: within current tab + act + statusDrop filters (not class)
+  classCounts={}; actCounts={all:0}; statusDropCounts={all:0}; assetCounts={all:0};
+  // Class counts: within current tab + act + asset + statusDrop (not class)
   for(const it of items){
-    if(!statusMatch(it) || !actMatch(it) || !statusDropMatch(it)) continue;
+    if(!statusMatch(it) || !actMatch(it) || !assetMatch(it) || !statusDropMatch(it)) continue;
     const c=it.asset_class||'other';
     classCounts[c]=(classCounts[c]||0)+1;
   }
-  // Act counts: within tab + class + statusDrop
+  // Act counts: within tab + class + asset + statusDrop
   for(const it of items){
-    if(!statusMatch(it) || !classMatch(it) || !statusDropMatch(it)) continue;
+    if(!statusMatch(it) || !classMatch(it) || !assetMatch(it) || !statusDropMatch(it)) continue;
     actCounts.all=(actCounts.all||0)+1;
     if(it.act==null || it.act==='' || typeof it.act==='undefined') actCounts.none=(actCounts.none||0)+1;
     else { const k=String(it.act); actCounts[k]=(actCounts[k]||0)+1; }
   }
-  // Status-drop counts: within tab + class + act
+  // Asset counts: within tab + class + act + statusDrop (not asset)
   for(const it of items){
-    if(!statusMatch(it) || !classMatch(it) || !actMatch(it)) continue;
+    if(!statusMatch(it) || !classMatch(it) || !actMatch(it) || !statusDropMatch(it)) continue;
+    assetCounts.all=(assetCounts.all||0)+1;
+    const k=assetIdentity(it);
+    assetCounts[k]=(assetCounts[k]||0)+1;
+  }
+  // Status-drop counts: within tab + class + act + asset
+  for(const it of items){
+    if(!statusMatch(it) || !classMatch(it) || !actMatch(it) || !assetMatch(it)) continue;
     statusDropCounts.all=(statusDropCounts.all||0)+1;
     const key = it.status==='needs-review'?'needs-review'
       : it.status==='training'?'training'
@@ -1365,7 +1467,7 @@ function renderTabs(){
       : s==='finalists'?items.filter(i=>i.status==='finalist')
       : s==='rejected'?items.filter(i=>i.status==='rejected'&&!isRecentlyRejected(i))
       : items.filter(i=>i.status===s);
-    const count = base.filter(it=>classMatch(it)&&actMatch(it)&&statusDropMatch(it)).length;
+    const count = base.filter(it=>classMatch(it)&&actMatch(it)&&assetMatch(it)&&statusDropMatch(it)).length;
     b.textContent=`${tabLabel(s)} (${count})`;
     b.onclick=()=>{ current=s; pageNum=1; selected.clear(); writeQuery(); recountFilters(); renderTabs(); renderFilters(); renderGrid(); updateSelUI(); };
     tabs.appendChild(b);
@@ -1381,6 +1483,37 @@ function fillSelect(sel, options, currentVal, onChange){
   }
   sel.onchange=()=>onChange(sel.value);
 }
+function fillSelectGrouped(sel, allOpt, groups, currentVal, onChange){
+  sel.innerHTML='';
+  const top=document.createElement('option');
+  top.value=allOpt.v; top.textContent=allOpt.label;
+  if(String(allOpt.v)===String(currentVal)) top.selected=true;
+  sel.appendChild(top);
+  for(const g of groups){
+    if(!g.options.length) continue;
+    const og=document.createElement('optgroup');
+    og.label=g.label;
+    for(const opt of g.options){
+      const o=document.createElement('option');
+      o.value=opt.v; o.textContent=opt.label;
+      if(String(opt.v)===String(currentVal)) o.selected=true;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+  sel.onchange=()=>onChange(sel.value);
+}
+function setAssetFilter(v){
+  assetFilter=v||'all';
+  pageNum=1;
+  selected.clear();
+  writeQuery();
+  recountFilters();
+  renderTabs();
+  renderFilters();
+  renderGrid();
+  updateSelUI();
+}
 function renderFilters(){
   recountFilters();
   const classSel=document.getElementById('filterClass');
@@ -1388,6 +1521,7 @@ function renderFilters(){
   const statusSel=document.getElementById('filterStatus');
   const perSel=document.getElementById('filterPerPage');
   const sortSel=document.getElementById('filterSort');
+  const assetSel=document.getElementById('filterAsset');
   if(!classSel||!actSel||!statusSel) return;
   const classOpts=[{v:'all', label:`all (${Object.values(classCounts).reduce((a,b)=>a+b,0)})`}];
   for(const c of CLASS_ORDER){
@@ -1403,6 +1537,31 @@ function renderFilters(){
   }
   if(actCounts.none) actOpts.push({v:'none', label:`No act (${actCounts.none})`});
   fillSelect(actSel, actOpts, actFilter, v=>{ actFilter=v; pageNum=1; selected.clear(); writeQuery(); renderTabs(); renderFilters(); renderGrid(); updateSelUI(); });
+
+  if(assetSel){
+    const grouped={};
+    for(const g of ASSET_GROUP_ORDER) grouped[g]=[];
+    const present=new Set(items.map(assetIdentity));
+    if(assetFilter && assetFilter!=='all') present.add(assetFilter);
+    const keys=[...present].sort((a,b)=>{
+      const na=assetCounts[a]||0, nb=assetCounts[b]||0;
+      if(na!==nb) return nb-na;
+      return prettyAsset(a).localeCompare(prettyAsset(b));
+    });
+    for(const k of keys){
+      const n=assetCounts[k]||0;
+      const sample=items.find(it=>assetIdentity(it)===k);
+      const g=sample?assetGroupOf(sample):'Other';
+      if(!grouped[g]) grouped[g]=[];
+      grouped[g].push({v:k, label:`${prettyAsset(k)} (${n})`});
+    }
+    const groups=ASSET_GROUP_ORDER.filter(g=>(grouped[g]||[]).length).map(g=>({label:g, options:grouped[g]}));
+    for(const g of Object.keys(grouped)){
+      if(ASSET_GROUP_ORDER.includes(g)) continue;
+      if(grouped[g].length) groups.push({label:g, options:grouped[g]});
+    }
+    fillSelectGrouped(assetSel, {v:'all', label:`all (${assetCounts.all||0})`}, groups, assetFilter, setAssetFilter);
+  }
 
   const stOpts=STATUS_DROP_OPTS.map(o=>{
     const n = o.v==='all' ? (statusDropCounts.all||0) : (statusDropCounts[o.v]||0);
@@ -1481,16 +1640,19 @@ function renderGrid(){
     card.className='card'+(selected.has(it.id)?' selected':'');
     card.dataset.id=it.id;
     const label=it.label||((it.asset||'')+' · '+(it.round||''));
+    const ak=assetIdentity(it);
     const mode=recentMode?'recent':(finalistMode?'finalist':'review');
     card.innerHTML=`
       <img loading="lazy" decoding="async" width="256" height="256" src="${it.thumb_url}" alt="${escapeHtml(it.id)}" data-full="${it.image_url}"/>
       <div class="body">
-        <div class="round">${escapeHtml(label)}</div>
-        <div class="id">${it.cell||''} ${it.key?'('+it.key+')':''}<br/>${escapeHtml(it.id)}${recentMode?('<br/>rejected '+(it.rejected_at||'')):''}</div>
+        <div class="round"><button type="button" class="asset-link" data-asset="${escapeHtml(ak)}">${escapeHtml(prettyAsset(ak))}</button></div>
+        <div class="id">${escapeHtml(label)}<br/>${it.cell||''} ${it.key?'('+it.key+')':''}<br/>${escapeHtml(it.id)}${recentMode?('<br/>rejected '+(it.rejected_at||'')):''}</div>
         ${it.note&&recentMode?`<div class="existing-note">Note: ${escapeHtml(it.note)}</div>`:''}
         <div class="sel-row"><input class="selbox" type="checkbox" ${selected.has(it.id)?'checked':''} aria-label="Select ${escapeHtml(it.id)}"/></div>
         ${cardActionsHtml(it, mode)}
       </div>`;
+    const al=card.querySelector('.asset-link');
+    if(al) al.addEventListener('click',e=>{ e.preventDefault(); e.stopPropagation(); setAssetFilter(al.getAttribute('data-asset')||'all'); });
     const cb=card.querySelector('.selbox');
     cb.addEventListener('click',e=>{ e.stopPropagation(); toggleSelect(it.id, cb.checked); });
     const img=card.querySelector('img');
@@ -1691,6 +1853,10 @@ def page(mobile: bool) -> str:
         <select class="filter-select" id="filterAct" aria-label="Act"></select>
       </div>
       <div class="filter-field">
+        <label class="filter-label" for="filterAsset">Asset</label>
+        <select class="filter-select" id="filterAsset" aria-label="Asset"></select>
+      </div>
+      <div class="filter-field">
         <label class="filter-label" for="filterSort">Sort</label>
         <select class="filter-select" id="filterSort" aria-label="Sort by date"></select>
       </div>
@@ -1737,7 +1903,7 @@ def page(mobile: bool) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ArtGallery/1.6-sort"
+    server_version = "ArtGallery/1.7-assetfilter"
 
     def log_message(self, fmt, *args):
         print(f"[{now_iso()}] {self.address_string()} " + (fmt % args), flush=True)
@@ -1771,6 +1937,7 @@ class Handler(BaseHTTPRequestHandler):
             status = (qs.get("status") or [None])[0]
             class_f = (qs.get("class") or [None])[0]
             act_f = (qs.get("act") or [None])[0]
+            asset_f = (qs.get("asset") or [None])[0]
             entries = load_manifest()
             for e in entries:
                 ensure_class_fields(e)
@@ -1807,6 +1974,9 @@ class Handler(BaseHTTPRequestHandler):
                             want = act_f
                         if e.get("act") != want and str(e.get("act")) != str(act_f):
                             continue
+                ak = asset_identity(e)
+                if asset_f and asset_f != "all" and ak != asset_f:
+                    continue
                 sp = e.get("spark_path") or ""
                 tp = e.get("thumb_path") or ""
                 created, created_src = item_created(e)
@@ -1817,6 +1987,8 @@ class Handler(BaseHTTPRequestHandler):
                         "seed", "note", "destination", "steer", "rejected_at", "reviewed_at",
                         "noted_at", "label", "asset_class", "act",
                     )},
+                    "asset_key": ak,
+                    "asset_group": asset_group(ak, e.get("asset_class") or ""),
                     "created_at": created,
                     "created_at_source": created_src,
                     "recently_rejected": is_recently_rejected(e),
@@ -1830,6 +2002,8 @@ class Handler(BaseHTTPRequestHandler):
                 items = sort_items_by_created(items, "oldest")
             class_counts = {c: 0 for c in ASSET_CLASSES}
             act_counts: dict = {}
+            asset_counts: dict = {}
+            asset_groups: dict = {}
             for e in entries:
                 cls = e.get("asset_class") or "other"
                 if cls not in class_counts:
@@ -1838,9 +2012,13 @@ class Handler(BaseHTTPRequestHandler):
                 a = e.get("act")
                 key = "none" if a is None else str(a)
                 act_counts[key] = act_counts.get(key, 0) + 1
+                ak = asset_identity(e)
+                asset_counts[ak] = asset_counts.get(ak, 0) + 1
+                asset_groups[ak] = asset_group(ak, cls)
             # needs-review breakdowns for callers
             nr_class = {c: 0 for c in ASSET_CLASSES}
             nr_act: dict = {}
+            nr_asset: dict = {}
             for e in entries:
                 if e.get("status") != "needs-review":
                     continue
@@ -1849,6 +2027,8 @@ class Handler(BaseHTTPRequestHandler):
                 a = e.get("act")
                 key = "none" if a is None else str(a)
                 nr_act[key] = nr_act.get(key, 0) + 1
+                ak = asset_identity(e)
+                nr_asset[ak] = nr_asset.get(ak, 0) + 1
             self._json(200, {
                 "items": items,
                 "configured": config_ready(cfg),
@@ -1859,6 +2039,9 @@ class Handler(BaseHTTPRequestHandler):
                 "act_counts": act_counts,
                 "needs_review_by_class": nr_class,
                 "needs_review_by_act": nr_act,
+                "needs_review_by_asset": nr_asset,
+                "asset_counts": asset_counts,
+                "asset_groups": asset_groups,
                 "class_labels": ASSET_CLASS_LABELS,
             })
             return
