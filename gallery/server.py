@@ -304,6 +304,167 @@ def parse_iso(s: str):
         return None
 
 
+# Creation-time for sort: generation metadata, then filename date, then file mtime, then added_at.
+_CREATED_CACHE: dict[tuple, tuple[str, str]] = {}
+_FN_DATE_RE = re.compile(
+    r"(?<![0-9])(20[0-9]{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12][0-9]|3[01])"
+    r"(?:[-_T ]?([01][0-9]|2[0-3])[-_.]?([0-5][0-9])(?:[-_.]?([0-5][0-9]))?)?(?![0-9])"
+)
+_PNG_TEXT_TIME_KEYS = frozenset({
+    "creation time", "creation_time", "create_time", "created_at",
+    "date:create", "date:modify", "datetime", "datetimeoriginal",
+    "date time", "date time original",
+})
+
+
+def _iso_from_dt(t: datetime) -> str:
+    # Naive datetimes are treated as local time (file mtimes, filename dates).
+    if t.tzinfo is None:
+        t = t.astimezone()
+    return t.astimezone().isoformat(timespec="seconds")
+
+
+def created_at_from_filename(name: str) -> str | None:
+    m = _FN_DATE_RE.search(name or "")
+    if not m:
+        return None
+    y, mo, d, hh, mm, ss = m.groups()
+    try:
+        t = datetime(
+            int(y), int(mo), int(d),
+            int(hh or 0), int(mm or 0), int(ss or 0),
+        )
+        return _iso_from_dt(t)
+    except Exception:
+        return None
+
+
+def created_at_from_png_meta(path: Path) -> str | None:
+    """Read PNG tIME / Creation Time text chunks without loading the image."""
+    try:
+        with path.open("rb") as f:
+            if f.read(8) != b"\x89PNG\r\n\x1a\n":
+                return None
+            import struct
+            read = 8
+            limit = 1_000_000
+            while read < limit:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                length, typ = struct.unpack(">I4s", hdr)
+                read += 8
+                data = f.read(length)
+                f.read(4)
+                read += length + 4
+                if typ in (b"IDAT", b"IEND"):
+                    break
+                if typ == b"tIME" and len(data) == 7:
+                    year, mon, day, hh, mm, ss = struct.unpack(">HBBBBB", data)
+                    t = datetime(year, mon, day, hh, mm, ss, tzinfo=timezone.utc)
+                    return _iso_from_dt(t)
+                if typ in (b"tEXt", b"iTXt") and data:
+                    key, _, rest = data.partition(b"\x00")
+                    k = key.decode("latin-1", "replace").strip().lower()
+                    if k not in _PNG_TEXT_TIME_KEYS:
+                        continue
+                    if typ == b"iTXt":
+                        # lang/translated-key compressed flag skip: rest is flag, method, lang, tkey, text
+                        parts = rest.split(b"\x00", 3)
+                        raw = parts[-1] if parts else b""
+                        if parts and parts[0][:1] == b"\x01":
+                            continue
+                        val = raw.decode("utf-8", "replace").strip()
+                    else:
+                        val = rest.decode("latin-1", "replace").strip()
+                    ts = parse_iso(val)
+                    if ts:
+                        return _iso_from_dt(ts)
+    except Exception:
+        return None
+    return None
+
+
+def file_mtime_iso(path: Path) -> str | None:
+    try:
+        if path.is_file():
+            return _iso_from_dt(datetime.fromtimestamp(path.stat().st_mtime))
+    except Exception:
+        return None
+    return None
+
+
+def item_created(entry: dict) -> tuple[str, str]:
+    """Return (iso_timestamp, source) for an item. source: metadata|filename|mtime|added_at|."""
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for key in ("source_path", "spark_path"):
+        raw = entry.get(key) or ""
+        if not raw:
+            continue
+        p = Path(raw)
+        sp = str(p)
+        if sp in seen:
+            continue
+        seen.add(sp)
+        paths.append(p)
+
+    mtimes: list[float] = []
+    existing: list[Path] = []
+    for p in paths:
+        try:
+            if p.is_file():
+                mtimes.append(p.stat().st_mtime)
+                existing.append(p)
+        except Exception:
+            continue
+    cache_key = (entry.get("id") or "", tuple(str(p) for p in paths), tuple(mtimes))
+    cached = _CREATED_CACHE.get(cache_key)
+    if cached:
+        return cached
+
+    for p in existing:
+        iso = created_at_from_png_meta(p)
+        if iso:
+            _CREATED_CACHE[cache_key] = (iso, "metadata")
+            return iso, "metadata"
+
+    for p in paths:
+        iso = created_at_from_filename(p.name)
+        if iso:
+            _CREATED_CACHE[cache_key] = (iso, "filename")
+            return iso, "filename"
+
+    mt_isos = [file_mtime_iso(p) for p in existing]
+    mt_isos = [x for x in mt_isos if x]
+    if mt_isos:
+        iso = min(mt_isos, key=lambda s: parse_iso(s) or datetime.max.replace(tzinfo=timezone.utc))
+        _CREATED_CACHE[cache_key] = (iso, "mtime")
+        return iso, "mtime"
+
+    added = entry.get("added_at") or ""
+    if parse_iso(added):
+        _CREATED_CACHE[cache_key] = (added, "added_at")
+        return added, "added_at"
+    _CREATED_CACHE[cache_key] = ("", "")
+    return "", ""
+
+
+def sort_items_by_created(items: list, order: str) -> list:
+    """order is 'newest' or 'oldest'. Missing timestamps sort last in both directions."""
+    sentinel_old = datetime.max.replace(tzinfo=timezone.utc)
+    sentinel_new = datetime.min.replace(tzinfo=timezone.utc)
+
+    def key(it: dict):
+        t = parse_iso(it.get("created_at") or "")
+        if t is None:
+            t = sentinel_old if order == "oldest" else sentinel_new
+        return (t, it.get("id") or "")
+
+    reverse = order == "newest"
+    return sorted(items, key=key, reverse=reverse)
+
+
 def load_manifest() -> list:
     if not MANIFEST.exists():
         return []
@@ -971,12 +1132,18 @@ const STATUS_DROP_OPTS = [
   {v:'hidden-empty', label:'hidden empty'},
 ];
 const PER_PAGE_OPTS = [10,25,50,100];
+const SORT_OPTS = [
+  {v:'newest', label:'Newest first'},
+  {v:'oldest', label:'Oldest first'},
+];
+const SORT_KEY = 'art-gallery-sort';
 const ARCHIVE_REJECT_HOURS = (window.__ARCHIVE_REJECT_HOURS__|0) || 24;
 const RECENT_MS = ARCHIVE_REJECT_HOURS*60*60*1000;
 let current = 'needs-review';
 let classFilter = 'all';
 let actFilter = 'all';
 let statusDrop = 'all';
+let sortOrder = 'newest';
 let pageNum = 1;
 let perPage = IS_MOBILE_DEFAULT();
 let items = [];
@@ -990,6 +1157,22 @@ const IS_MOBILE = !!window.__MOBILE__;
 
 function IS_MOBILE_DEFAULT(){ return (window.__MOBILE__ || (window.matchMedia && matchMedia('(max-width:720px)').matches)) ? 10 : 50; }
 
+function normalizeSort(v){
+  v=String(v||'').toLowerCase();
+  if(v==='oldest'||v==='oldest-first'||v==='asc'||v==='created_asc') return 'oldest';
+  if(v==='newest'||v==='newest-first'||v==='desc'||v==='created_desc') return 'newest';
+  return '';
+}
+function readSortPref(){
+  const q=new URLSearchParams(location.search);
+  const fromQ=normalizeSort(q.get('sort'));
+  if(fromQ) return fromQ;
+  try{
+    const fromLs=normalizeSort(localStorage.getItem(SORT_KEY));
+    if(fromLs) return fromLs;
+  }catch(e){}
+  return 'newest';
+}
 function readQuery(){
   const q=new URLSearchParams(location.search);
   const st=q.get('status'); if(st && STATUS_TABS.includes(st)) current=st;
@@ -999,6 +1182,7 @@ function readQuery(){
   const pp=parseInt(q.get('per_page')||'',10); if(PER_PAGE_OPTS.includes(pp)) perPage=pp;
   else perPage=IS_MOBILE_DEFAULT();
   const pg=parseInt(q.get('page')||'1',10); pageNum=Number.isFinite(pg)&&pg>0?pg:1;
+  sortOrder=readSortPref();
 }
 function writeQuery(){
   const q=new URLSearchParams();
@@ -1006,8 +1190,10 @@ function writeQuery(){
   if(classFilter && classFilter!=='all') q.set('class', classFilter);
   if(actFilter && actFilter!=='all') q.set('act', actFilter);
   if(statusDrop && statusDrop!=='all') q.set('status_drop', statusDrop);
+  if(sortOrder && sortOrder!=='newest') q.set('sort', sortOrder);
   if(perPage !== IS_MOBILE_DEFAULT()) q.set('per_page', String(perPage));
   if(pageNum>1) q.set('page', String(pageNum));
+  try{ localStorage.setItem(SORT_KEY, sortOrder==='oldest'?'oldest':'newest'); }catch(e){}
   const qs=q.toString();
   const next=location.pathname+(qs?('?'+qs):'');
   if(next!==location.pathname+location.search) history.replaceState(null,'',next);
@@ -1066,8 +1252,39 @@ function actMatch(it){
   if(actFilter==='none') return it.act==null || it.act==='' || typeof it.act==='undefined';
   return String(it.act)===String(actFilter);
 }
+function createdMs(it){
+  const t=parseTs(it.created_at||it.added_at);
+  return t?t.getTime():0;
+}
+function sortItemsByCreated(list){
+  const dir=sortOrder==='oldest'?1:-1;
+  return [...list].sort((a,b)=>{
+    const da=createdMs(a), db=createdMs(b);
+    if(da!==db) return (da-db)*dir;
+    return String(a.id||'').localeCompare(String(b.id||''));
+  });
+}
+function sortFinalists(list){
+  const sorted=sortItemsByCreated(list);
+  const groups=new Map();
+  for(const it of sorted){
+    const k=String(it.asset||'unknown');
+    if(!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(it);
+  }
+  const keys=[...groups.keys()].sort((a,b)=>{
+    const ga=groups.get(a), gb=groups.get(b);
+    const ea=sortOrder==='oldest'?createdMs(ga[0]):createdMs(ga[ga.length-1]);
+    const eb=sortOrder==='oldest'?createdMs(gb[0]):createdMs(gb[gb.length-1]);
+    if(ea!==eb) return sortOrder==='oldest'?ea-eb:eb-ea;
+    return a.localeCompare(b);
+  });
+  return keys.flatMap(k=>groups.get(k));
+}
 function visibleItems(){
-  return items.filter(it=>statusMatch(it) && classMatch(it) && actMatch(it) && statusDropMatch(it));
+  const list=items.filter(it=>statusMatch(it) && classMatch(it) && actMatch(it) && statusDropMatch(it));
+  if(current==='finalists') return sortFinalists(list);
+  return sortItemsByCreated(list);
 }
 function pagedItems(){
   const list=visibleItems();
@@ -1170,6 +1387,7 @@ function renderFilters(){
   const actSel=document.getElementById('filterAct');
   const statusSel=document.getElementById('filterStatus');
   const perSel=document.getElementById('filterPerPage');
+  const sortSel=document.getElementById('filterSort');
   if(!classSel||!actSel||!statusSel) return;
   const classOpts=[{v:'all', label:`all (${Object.values(classCounts).reduce((a,b)=>a+b,0)})`}];
   for(const c of CLASS_ORDER){
@@ -1192,6 +1410,11 @@ function renderFilters(){
   }).filter(o=>o.v==='all' || (statusDropCounts[o.v]||0)>0 || statusDrop===o.v);
   fillSelect(statusSel, stOpts, statusDrop, v=>{ statusDrop=v; pageNum=1; selected.clear(); writeQuery(); renderTabs(); renderFilters(); renderGrid(); updateSelUI(); });
 
+  if(sortSel){
+    fillSelect(sortSel, SORT_OPTS, sortOrder, v=>{
+      sortOrder=normalizeSort(v)||'newest'; pageNum=1; writeQuery(); renderGrid(); updateSelUI();
+    });
+  }
   if(perSel){
     fillSelect(perSel, PER_PAGE_OPTS.map(n=>({v:String(n), label:String(n)+'/page'})), String(perPage), v=>{
       perPage=parseInt(v,10)||IS_MOBILE_DEFAULT(); pageNum=1; writeQuery(); renderGrid(); updateSelUI();
@@ -1242,7 +1465,7 @@ function renderGrid(){
   const recentMode=current==='recently-rejected';
   const finalistMode=current==='finalists';
   let lastAsset=null;
-  const ordered=finalistMode?[...page].sort((a,b)=>String(a.asset||'').localeCompare(String(b.asset||''))||String(a.id).localeCompare(String(b.id))):page;
+  const ordered=page;
   for(const it of ordered){
     if(finalistMode){
       const a=it.asset||'unknown';
@@ -1467,6 +1690,10 @@ def page(mobile: bool) -> str:
         <label class="filter-label" for="filterAct">By Act</label>
         <select class="filter-select" id="filterAct" aria-label="Act"></select>
       </div>
+      <div class="filter-field">
+        <label class="filter-label" for="filterSort">Sort</label>
+        <select class="filter-select" id="filterSort" aria-label="Sort by date"></select>
+      </div>
       <div class="filter-field" style="max-width:140px">
         <label class="filter-label" for="filterPerPage">Per page</label>
         <select class="filter-select" id="filterPerPage" aria-label="Per page"></select>
@@ -1510,7 +1737,7 @@ def page(mobile: bool) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ArtGallery/1.5-paging"
+    server_version = "ArtGallery/1.6-sort"
 
     def log_message(self, fmt, *args):
         print(f"[{now_iso()}] {self.address_string()} " + (fmt % args), flush=True)
@@ -1582,6 +1809,7 @@ class Handler(BaseHTTPRequestHandler):
                             continue
                 sp = e.get("spark_path") or ""
                 tp = e.get("thumb_path") or ""
+                created, created_src = item_created(e)
                 items.append({
                     **{k: e.get(k) for k in (
                         "id", "round", "asset", "status", "spark_path", "source_path",
@@ -1589,10 +1817,17 @@ class Handler(BaseHTTPRequestHandler):
                         "seed", "note", "destination", "steer", "rejected_at", "reviewed_at",
                         "noted_at", "label", "asset_class", "act",
                     )},
+                    "created_at": created,
+                    "created_at_source": created_src,
                     "recently_rejected": is_recently_rejected(e),
                     "thumb_url": f"/file?p={quote(tp)}" if tp else f"/file?p={quote(sp)}",
                     "image_url": f"/file?p={quote(sp)}",
                 })
+            sort_f = ((qs.get("sort") or [""])[0] or "").strip().lower()
+            if sort_f in ("newest", "newest-first", "desc", "created_desc"):
+                items = sort_items_by_created(items, "newest")
+            elif sort_f in ("oldest", "oldest-first", "asc", "created_asc"):
+                items = sort_items_by_created(items, "oldest")
             class_counts = {c: 0 for c in ASSET_CLASSES}
             act_counts: dict = {}
             for e in entries:
