@@ -1643,8 +1643,9 @@ function renderGrid(){
     const ak=assetIdentity(it);
     const mode=recentMode?'recent':(finalistMode?'finalist':'review');
     card.innerHTML=`
-      <img loading="lazy" decoding="async" width="256" height="256" src="${it.thumb_url}" alt="${escapeHtml(it.id)}" data-full="${it.image_url}"/>
+      <img loading="lazy" decoding="async" width="256" height="256" src="${it.anim_url||it.thumb_url}" alt="${escapeHtml(it.id)}" data-full="${it.anim_url||it.image_url}"/>
       <div class="body">
+        ${it.anim_url?`<div class="anim-links"><a href="${it.anim_url}" target="_blank" rel="noopener">&#9654; Play animation</a> &middot; <a href="${it.image_url}" target="_blank" rel="noopener">Frame sheet</a></div>`:''}
         <div class="round"><button type="button" class="asset-link" data-asset="${escapeHtml(ak)}">${escapeHtml(prettyAsset(ak))}</button></div>
         <div class="id">${escapeHtml(label)}<br/>${it.cell||''} ${it.key?'('+it.key+')':''}<br/>${escapeHtml(it.id)}${recentMode?('<br/>rejected '+(it.rejected_at||'')):''}</div>
         ${it.note&&recentMode?`<div class="existing-note">Note: ${escapeHtml(it.note)}</div>`:''}
@@ -1994,6 +1995,7 @@ class Handler(BaseHTTPRequestHandler):
                     "recently_rejected": is_recently_rejected(e),
                     "thumb_url": f"/file?p={quote(tp)}" if tp else f"/file?p={quote(sp)}",
                     "image_url": f"/file?p={quote(sp)}",
+                    "anim_url": (f"/file?p={quote(str(Path(sp).with_suffix('.gif')))}" if sp and Path(sp).with_suffix(".gif").is_file() else ""),
                 })
             sort_f = ((qs.get("sort") or [""])[0] or "").strip().lower()
             if sort_f in ("newest", "newest-first", "desc", "created_desc"):
