@@ -16,10 +16,12 @@ from pathlib import Path
 import re
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import urllib.request
+import fcntl
 
 GALLERY_DIR = Path(__file__).resolve().parent
 ART_ROOT = GALLERY_DIR.parent
 MANIFEST = ART_ROOT / "manifest.json"
+MANIFEST_LOCK = ART_ROOT / "manifest.json.lock"
 CONFIG_PATH = GALLERY_DIR / "config.json"
 CLICKS = GALLERY_DIR / "clicks.jsonl"
 WEBHOOK_CURSOR = GALLERY_DIR / "webhook_cursor.json"
@@ -141,6 +143,59 @@ def asset_identity(entry: dict) -> str:
         if key:
             return key
     return "unknown"
+
+
+_SERIES_ROUND_RE = re.compile(r"^(?P<series>.+?)-round-(?P<n>\d+)(?:-(?P<suf>.*))?$", re.I)
+_SERIES_RSUF_RE = re.compile(r"^(?P<series>.+?)-r(?P<n>\d+)$", re.I)
+_VARIANT_DIR_RE = re.compile(r"^(?:[nswe]|ne|nw|se|sw)(?:[_-]\d+)?$", re.I)
+
+
+def series_and_round(entry: dict) -> tuple[str, int]:
+    """(series, round_number) from the round name, e.g. dragon-fly-round-6-se-wing -> (dragon-fly, 6)."""
+    rnd = (entry.get("round") or "").strip()
+    if not rnd:
+        return asset_identity(entry), 0
+    m = _SERIES_ROUND_RE.match(rnd)
+    if m:
+        return m.group("series"), int(m.group("n"))
+    m = _SERIES_RSUF_RE.match(rnd)
+    if m:
+        return m.group("series"), int(m.group("n"))
+    return rnd, 1
+
+
+def series_key(entry: dict) -> str:
+    return series_and_round(entry)[0]
+
+
+def variant_key(entry: dict) -> str:
+    """Stable per-facing / per-frame / per-sheet key across rounds of the same series."""
+    cell = str(entry.get("cell") or "").strip()
+    key = str(entry.get("key") or "").strip()
+    for raw in (key, cell):
+        if raw and _VARIANT_DIR_RE.match(raw):
+            return raw.lower()
+
+    def _norm(s: str) -> str:
+        s = s.strip().lower()
+        s = re.sub(r"-round-\d+(?:-[a-z0-9]+)?", "", s)
+        s = re.sub(r"-r\d+[a-z]*", "", s)
+        s = re.sub(r"-v\d+$", "", s)
+        s = re.sub(r"r\d+[a-z]*", "", s)
+        s = re.sub(r"-{2,}", "-", s).strip("-")
+        return s
+
+    if key and key.lower() not in {"sheet"}:
+        n = _norm(key)
+        if n:
+            return n
+    if cell:
+        n = _norm(cell)
+        if n:
+            return n
+    if key.lower() == "sheet":
+        return "sheet"
+    return _norm(str(entry.get("id") or "unknown")) or "unknown"
 
 
 def asset_group(asset_id: str, asset_class: str | None = None) -> str:
@@ -508,6 +563,34 @@ def sort_items_by_created(items: list, order: str) -> list:
     return sorted(items, key=key, reverse=reverse)
 
 
+_MANIFEST_THREAD_LOCK = threading.Lock()
+
+
+class ManifestLock:
+    """Cross-process (flock) and in-process lock around manifest load/save."""
+
+    def __enter__(self):
+        self._thr = _MANIFEST_THREAD_LOCK
+        self._thr.acquire()
+        try:
+            MANIFEST_LOCK.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(MANIFEST_LOCK, "a+", encoding="utf-8")
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            self._thr.release()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            try:
+                self._fh.close()
+            finally:
+                self._thr.release()
+
+
 def load_manifest() -> list:
     if not MANIFEST.exists():
         return []
@@ -519,7 +602,9 @@ def load_manifest() -> list:
 
 
 def save_manifest(entries: list) -> None:
-    MANIFEST.write_text(json.dumps(entries, indent=2) + "\n")
+    tmp = MANIFEST.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(entries, indent=2) + "\n")
+    tmp.replace(MANIFEST)
 
 
 def load_config() -> dict:
@@ -841,12 +926,40 @@ def status_dir(status: str) -> Path:
         "rejected": ART_ROOT / "rejected",
         "training": ART_ROOT / "training",
         "in-game": ART_ROOT / "in-game",
+        "archived": ART_ROOT / "archived",
     }
     return mapping.get(status, ART_ROOT / "needs-review")
 
 
+def _unique_dest(dest: Path) -> Path:
+    """If dest exists, pick a non-colliding name. Never deletes the existing file."""
+    if not dest.exists():
+        return dest
+    stem, suf = dest.stem, dest.suffix
+    for i in range(1, 1000):
+        cand = dest.with_name(f"{stem}-dup{i}{suf}")
+        if not cand.exists():
+            return cand
+    raise RuntimeError(f"could not place {dest}")
+
+
+def _safe_replace(src: Path, dest: Path) -> Path | None:
+    """Move src to dest (or a unique sibling). Never unlinks dest. Returns final path."""
+    try:
+        src_res = src.resolve()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest = _unique_dest(dest)
+        if dest.exists() and dest.resolve() == src_res:
+            return dest
+        src.replace(dest)
+        return dest
+    except Exception as e:
+        print(f"move failed {src} -> {dest}: {e}", flush=True)
+        return None
+
+
 def move_entry_files(entry: dict, new_status: str) -> None:
-    """Move spark + thumb into status/<round>/…; update paths. Sources stay put."""
+    """Move spark + thumb (+ gif sidecar) into status/<round>/…; update paths. Sources stay put. Never deletes."""
     sp = Path(entry.get("spark_path") or "")
     if not sp.exists() or not sp.is_file():
         return
@@ -854,28 +967,23 @@ def move_entry_files(entry: dict, new_status: str) -> None:
     dest_root = status_dir(new_status) / round_name
     dest_root.mkdir(parents=True, exist_ok=True)
     dest = dest_root / sp.name
-    if sp.resolve() != dest.resolve():
-        try:
-            if dest.exists():
-                dest.unlink()
-            sp.replace(dest)
-            entry["spark_path"] = str(dest)
-        except Exception as e:
-            print(f"move spark failed {sp} -> {dest}: {e}", flush=True)
+    if sp.resolve() != dest.resolve() or not dest.exists():
+        moved = _safe_replace(sp, dest)
+        if not moved:
             return
+        entry["spark_path"] = str(moved)
+        gif = sp.with_suffix(".gif")
+        if gif.is_file():
+            gdest = dest_root / gif.name
+            _safe_replace(gif, gdest)
     tp = Path(entry.get("thumb_path") or "")
     if tp.exists() and tp.is_file():
         thumb_dir = dest_root / "thumbs"
         thumb_dir.mkdir(parents=True, exist_ok=True)
         tdest = thumb_dir / tp.name
-        try:
-            if tp.resolve() != tdest.resolve():
-                if tdest.exists():
-                    tdest.unlink()
-                tp.replace(tdest)
-            entry["thumb_path"] = str(tdest)
-        except Exception as e:
-            print(f"move thumb failed {tp} -> {tdest}: {e}", flush=True)
+        moved_t = _safe_replace(tp, tdest) if (not tdest.exists() or tp.resolve() != tdest.resolve()) else tdest
+        if moved_t:
+            entry["thumb_path"] = str(moved_t)
 
 
 
@@ -939,10 +1047,27 @@ def apply_action(entry: dict, action: str, note: str, destination: str) -> dict:
         if note:
             entry["note"] = note
             entry["noted_at"] = now_iso()
+    elif action == "archive":
+        entry["status"] = "archived"
+        entry["archived_at"] = now_iso()
+        if note:
+            entry["archive_reason"] = note
+        move_entry_files(entry, "archived")
+    elif action == "redo":
+        if entry.get("status") in ("approved", "finalist", "rejected", "archived", "training", "in-game"):
+            move_entry_files(entry, "needs-review")
+        entry["status"] = "needs-review"
+        entry["redo"] = True
+        entry["reviewed_at"] = now_iso()
+        entry.pop("rejected_at", None)
+        entry.pop("steer", None)
+        if note:
+            entry["note"] = note
     elif action in ("unreject", "undo", "back-to-review"):
         entry["status"] = "needs-review"
         entry.pop("rejected_at", None)
         entry.pop("steer", None)
+        entry.pop("archive_reason", None)
         entry["reviewed_at"] = now_iso()
         move_entry_files(entry, "needs-review")
     return entry
@@ -1359,11 +1484,16 @@ function sortItemsByCreated(list){
     return String(a.id||'').localeCompare(String(b.id||''));
   });
 }
-function sortFinalists(list){
+function seriesKey(it){
+  if(it.series_key) return String(it.series_key);
+  return assetIdentity(it);
+}
+function sortFinalists(list){ return sortGrouped(list); }
+function sortGrouped(list){
   const sorted=sortItemsByCreated(list);
   const groups=new Map();
   for(const it of sorted){
-    const k=String(it.asset||'unknown');
+    const k=seriesKey(it);
     if(!groups.has(k)) groups.set(k, []);
     groups.get(k).push(it);
   }
@@ -1378,8 +1508,7 @@ function sortFinalists(list){
 }
 function visibleItems(){
   const list=items.filter(it=>statusMatch(it) && classMatch(it) && actMatch(it) && assetMatch(it) && statusDropMatch(it));
-  if(current==='finalists') return sortFinalists(list);
-  return sortItemsByCreated(list);
+  return sortGrouped(list);
 }
 function pagedItems(){
   const list=visibleItems();
@@ -1451,7 +1580,7 @@ function toggleSelect(id, on){
   updateSelUI();
 }
 function tabLabel(s){
-  if(s==='needs-review') return 'Needs review';
+  if(s==='needs-review') return 'Inbox';
   if(s==='finalists') return 'Finalists';
   if(s==='recently-rejected') return 'Recently rejected';
   if(s==='hidden-empty') return 'Hidden empty';
@@ -1623,18 +1752,18 @@ function renderGrid(){
   empty.style.display=total?'none':'block';
   const recentMode=current==='recently-rejected';
   const finalistMode=current==='finalists';
-  let lastAsset=null;
+  let lastGroup=null;
   const ordered=page;
   for(const it of ordered){
-    if(finalistMode){
-      const a=it.asset||'unknown';
-      if(a!==lastAsset){
-        lastAsset=a;
-        const h=document.createElement('div');
-        h.className='asset-group';
-        h.textContent=a;
-        grid.appendChild(h);
-      }
+    const g=seriesKey(it);
+    if(g!==lastGroup){
+      lastGroup=g;
+      const inGroup=page.filter(x=>seriesKey(x)===g);
+      const rounds=[...new Set(inGroup.map(x=>x.round).filter(Boolean))];
+      const h=document.createElement('div');
+      h.className='asset-group';
+      h.textContent=prettyAsset(g)+' · '+inGroup.length+(inGroup.length===1?' item':' items')+(rounds.length?(' · '+rounds.join(', ')):"");
+      grid.appendChild(h);
     }
     const card=document.createElement('div');
     card.className='card'+(selected.has(it.id)?' selected':'');
@@ -1904,7 +2033,7 @@ def page(mobile: bool) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ArtGallery/1.7-assetfilter"
+    server_version = "ArtGallery/1.8-inbox"
 
     def log_message(self, fmt, *args):
         print(f"[{now_iso()}] {self.address_string()} " + (fmt % args), flush=True)
@@ -1990,6 +2119,9 @@ class Handler(BaseHTTPRequestHandler):
                     )},
                     "asset_key": ak,
                     "asset_group": asset_group(ak, e.get("asset_class") or ""),
+                    "series_key": series_key(e),
+                    "series_round": series_and_round(e)[1],
+                    "variant_key": variant_key(e),
                     "created_at": created,
                     "created_at_source": created_src,
                     "recently_rejected": is_recently_rejected(e),
@@ -2085,52 +2217,54 @@ class Handler(BaseHTTPRequestHandler):
         action = (payload.get("action") or "").strip().lower()
         note = payload.get("note") or ""
         destination = payload.get("destination") or ""
-        if action not in ("approve", "finalist", "final", "reject", "note", "steer", "unreject", "undo", "back-to-review"):
-            self._json(400, {"error": "action must be finalist|final|reject|note|steer|unreject|undo|back-to-review"})
+        if action not in ("approve", "finalist", "final", "reject", "note", "steer", "unreject", "undo", "back-to-review", "archive", "redo"):
+            self._json(400, {"error": "action must be finalist|final|reject|note|steer|unreject|undo|back-to-review|archive|redo"})
             return
         if action == "reject":
             note = ""
         ids = payload.get("ids")
         paths = payload.get("paths")
         bulk = isinstance(ids, list) and len(ids) > 0
-        entries = load_manifest()
         updated = []
-        if bulk:
-            if not isinstance(paths, list):
-                paths = []
-            path_by_id = {}
-            for i, eid in enumerate(ids):
-                if i < len(paths) and paths[i]:
-                    path_by_id[eid] = paths[i]
-            resolved_paths = []
-            for entry_id in ids:
+        hook_body = None
+        with ManifestLock():
+            entries = load_manifest()
+            if bulk:
+                if not isinstance(paths, list):
+                    paths = []
+                path_by_id = {}
+                for i, eid in enumerate(ids):
+                    if i < len(paths) and paths[i]:
+                        path_by_id[eid] = paths[i]
+                resolved_paths = []
+                for entry_id in ids:
+                    idx, entry = find_entry(entries, entry_id)
+                    if entry is None:
+                        continue
+                    path = path_by_id.get(entry_id) or entry.get("spark_path") or ""
+                    apply_action(entry, action, note, destination)
+                    entries[idx] = entry
+                    updated.append(entry)
+                    resolved_paths.append(path)
+                save_manifest(entries)
+                hook_body = build_hook(action, True, ids, resolved_paths, note, destination)
+            else:
+                entry_id = payload.get("id") or ""
+                path = payload.get("path") or ""
+                if not entry_id:
+                    self._json(400, {"error": "id or ids required"})
+                    return
                 idx, entry = find_entry(entries, entry_id)
                 if entry is None:
-                    continue
-                path = path_by_id.get(entry_id) or entry.get("spark_path") or ""
+                    self._json(404, {"error": "unknown id"})
+                    return
+                if not path:
+                    path = entry.get("spark_path") or ""
                 apply_action(entry, action, note, destination)
                 entries[idx] = entry
+                save_manifest(entries)
                 updated.append(entry)
-                resolved_paths.append(path)
-            save_manifest(entries)
-            hook_body = build_hook(action, True, ids, resolved_paths, note, destination)
-        else:
-            entry_id = payload.get("id") or ""
-            path = payload.get("path") or ""
-            if not entry_id:
-                self._json(400, {"error": "id or ids required"})
-                return
-            idx, entry = find_entry(entries, entry_id)
-            if entry is None:
-                self._json(404, {"error": "unknown id"})
-                return
-            if not path:
-                path = entry.get("spark_path") or ""
-            apply_action(entry, action, note, destination)
-            entries[idx] = entry
-            save_manifest(entries)
-            updated.append(entry)
-            hook_body = build_hook(action, False, [], [], note, destination, entry_id, path)
+                hook_body = build_hook(action, False, [], [], note, destination, entry_id, path)
         cfg = load_config()
         # Persist click immediately; webhook is batched by background thread.
         append_click({
@@ -2165,8 +2299,9 @@ def main():
     if not CLICKS.exists():
         CLICKS.write_text("")
     try:
-        entries = load_manifest()
-        stats = classify_empty_and_archive(entries)
+        with ManifestLock():
+            entries = load_manifest()
+            stats = classify_empty_and_archive(entries)
         print(
             f"gallery startup maintenance archive_hours={archive_reject_hours()} "
             f"archived={stats['archived']} hidden_empty={stats['hidden_empty']} "
