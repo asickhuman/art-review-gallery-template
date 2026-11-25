@@ -1153,7 +1153,7 @@ h1{margin:0;color:var(--green-bright);letter-spacing:.06em;text-transform:upperc
 .card{background:var(--panel);border:2px solid var(--line);border-radius:8px;overflow:hidden;
   display:flex;flex-direction:column;min-width:0;}
 .card.selected{border-color:var(--green-bright);box-shadow:0 0 0 2px rgba(57,255,20,.35);}
-.card img{width:100%;aspect-ratio:1/1;object-fit:contain;background:#030805;display:block;cursor:pointer;}
+.card img,.card video{width:100%;aspect-ratio:1/1;object-fit:contain;background:#030805;display:block;cursor:pointer;touch-action:manipulation;}
 .card .body{padding:8px;display:flex;flex-direction:column;gap:6px;flex:1;}
 .id{font-size:11px;color:var(--muted);word-break:break-all;}
 .round{font-size:12px;font-weight:800;color:var(--label);}
@@ -1283,7 +1283,7 @@ MOBILE_EXTRA = r"""
   color:var(--green-bright);font:700 28px/1 var(--mono);cursor:pointer;}
 .sheet-stage{position:relative;flex:1;min-height:40vh;display:flex;align-items:center;justify-content:center;
   touch-action:pan-y;overflow:hidden;border:2px solid var(--line);border-radius:8px;background:#030805;}
-.sheet-stage img{max-width:100%;max-height:55vh;object-fit:contain;user-select:none;-webkit-user-select:none;}
+.sheet-stage img,.sheet-stage video{max-width:100%;max-height:55vh;object-fit:contain;user-select:none;-webkit-user-select:none;touch-action:manipulation;}
 .sheet-meta{font-size:12px;color:var(--muted);text-align:center;}
 .sheet-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
 .sheet-actions .steer{grid-column:1/-1;}
@@ -1331,6 +1331,59 @@ let assetCounts = {};
 const selected = new Set();
 let undoState = null;
 const IS_MOBILE = !!window.__MOBILE__;
+const FULL_DBL_MS=300;
+function openFullSize(url){
+  if(!url) return;
+  const w=window.open(url,'_blank','noopener,noreferrer');
+  if(w){ try{ w.opener=null; }catch(e){} }
+  else {
+    const a=document.createElement('a');
+    a.href=url; a.target='_blank'; a.rel='noopener noreferrer';
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+}
+function bindFullSizeOpen(el, getUrl, onSingle){
+  if(!el) return;
+  let singleTimer=null, lastTap=0, ignoreClickUntil=0, startX=0, startY=0, moved=false;
+  function cancelSingle(){ if(singleTimer){ clearTimeout(singleTimer); singleTimer=null; } }
+  function armSingle(){
+    cancelSingle();
+    singleTimer=setTimeout(()=>{ singleTimer=null; lastTap=0; if(onSingle) onSingle(); }, FULL_DBL_MS);
+  }
+  function onDouble(){
+    cancelSingle();
+    lastTap=0;
+    openFullSize(typeof getUrl==='function'?getUrl():getUrl);
+  }
+  el.addEventListener('touchstart',e=>{
+    if(e.touches.length!==1){ moved=true; return; }
+    const t=e.changedTouches[0]; startX=t.clientX; startY=t.clientY; moved=false;
+  },{passive:true});
+  el.addEventListener('touchmove',e=>{
+    const t=e.changedTouches[0];
+    if(Math.abs(t.clientX-startX)>20 || Math.abs(t.clientY-startY)>20) moved=true;
+  },{passive:true});
+  el.addEventListener('touchend',e=>{
+    if(moved || e.changedTouches.length!==1) return;
+    const t=e.changedTouches[0];
+    if(Math.abs(t.clientX-startX)>=40) return;
+    const now=Date.now();
+    e.preventDefault();
+    ignoreClickUntil=now+FULL_DBL_MS+50;
+    if(now-lastTap<=FULL_DBL_MS){ onDouble(); return; }
+    lastTap=now;
+    armSingle();
+  },{passive:false});
+  el.addEventListener('click',e=>{
+    e.preventDefault();
+    if(Date.now()<ignoreClickUntil) return;
+    const now=Date.now();
+    if(now-lastTap<=FULL_DBL_MS){ onDouble(); return; }
+    lastTap=now;
+    armSingle();
+  });
+}
+
 
 function IS_MOBILE_DEFAULT(){ return (window.__MOBILE__ || (window.matchMedia && matchMedia('(max-width:720px)').matches)) ? 10 : 50; }
 
@@ -1772,7 +1825,7 @@ function renderGrid(){
     const ak=assetIdentity(it);
     const mode=recentMode?'recent':(finalistMode?'finalist':'review');
     card.innerHTML=`
-      <img loading="lazy" decoding="async" width="256" height="256" src="${it.anim_url||it.thumb_url}" alt="${escapeHtml(it.id)}" data-full="${it.anim_url||it.image_url}"/>
+      <img loading="lazy" decoding="async" width="256" height="256" src="${it.anim_url||it.thumb_url}" alt="${escapeHtml(it.id)}" data-full="${it.image_url||''}" title="Double-click or double-tap to open full size"/>
       <div class="body">
         ${it.anim_url?`<div class="anim-links"><a href="${it.anim_url}" target="_blank" rel="noopener">&#9654; Play animation</a> &middot; <a href="${it.image_url}" target="_blank" rel="noopener">Frame sheet</a></div>`:''}
         <div class="round"><button type="button" class="asset-link" data-asset="${escapeHtml(ak)}">${escapeHtml(prettyAsset(ak))}</button></div>
@@ -1785,9 +1838,8 @@ function renderGrid(){
     if(al) al.addEventListener('click',e=>{ e.preventDefault(); e.stopPropagation(); setAssetFilter(al.getAttribute('data-asset')||'all'); });
     const cb=card.querySelector('.selbox');
     cb.addEventListener('click',e=>{ e.stopPropagation(); toggleSelect(it.id, cb.checked); });
-    const img=card.querySelector('img');
-    img.addEventListener('click',e=>{
-      e.preventDefault();
+    const media=card.querySelector('img,video');
+    bindFullSizeOpen(media, ()=>media.getAttribute('data-full')||it.image_url, ()=>{
       if(IS_MOBILE){ openSheet(list.findIndex(x=>x.id===it.id)); return; }
       toggleSelect(it.id, !selected.has(it.id));
     });
@@ -1838,7 +1890,9 @@ function openSheet(idx){
   const list=visibleItems(); if(idx<0||idx>=list.length) return;
   sheetIdx=idx; const it=list[idx];
   const sheet=document.getElementById('sheet'); const scrim=document.getElementById('sheetScrim');
-  document.getElementById('sheetImg').src=it.image_url;
+  const sheetImg=document.getElementById('sheetImg');
+  sheetImg.src=it.image_url;
+  sheetImg.setAttribute('data-full', it.image_url||'');
   document.getElementById('sheetMeta').textContent=(it.label||it.asset||'')+' · '+(it.cell||'')+' · '+it.id;
   sheet.dataset.id=it.id;
   const rev=document.getElementById('sheetActionsReview');
@@ -1910,6 +1964,8 @@ function wire(){
       if(x0==null) return; const dx=e.changedTouches[0].clientX-x0; x0=null;
       if(Math.abs(dx)<40) return; sheetNav(dx<0?1:-1);
     },{passive:true});
+    const sheetImg=document.getElementById('sheetImg');
+    bindFullSizeOpen(sheetImg, ()=>sheetImg.getAttribute('data-full')||sheetImg.src, null);
   }
 }
 async function load(){
@@ -2033,7 +2089,7 @@ def page(mobile: bool) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ArtGallery/1.8-inbox"
+    server_version = "ArtGallery/1.9-fullsize"
 
     def log_message(self, fmt, *args):
         print(f"[{now_iso()}] {self.address_string()} " + (fmt % args), flush=True)
