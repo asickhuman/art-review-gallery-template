@@ -1732,6 +1732,7 @@ function renderFilters(){
     });
     for(const k of keys){
       const n=assetCounts[k]||0;
+      if(n===0 && assetFilter!==k) continue;
       const sample=items.find(it=>assetIdentity(it)===k);
       const g=sample?assetGroupOf(sample):'Other';
       if(!grouped[g]) grouped[g]=[];
